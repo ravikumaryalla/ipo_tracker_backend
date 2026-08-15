@@ -106,7 +106,7 @@ export function ipoRow(i: Ipo) {
     current_price: num(i.currentPrice),
     registrar: i.registrar,
     registrar_url: i.registrarUrl,
-    kfintech_company_id: i.kfintechCompanyId,
+    registrar_company_id: i.registrarCompanyId,
     source: i.source,
     created_by: i.createdBy,
     last_synced_at: ts(i.lastSyncedAt),

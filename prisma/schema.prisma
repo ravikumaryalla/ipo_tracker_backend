@@ -221,15 +221,21 @@ model Ipo {
   registrar    String? @default("KFintech")
   registrarUrl String? @default("https://ipostatus.kfintech.com/") @map("registrar_url")
 
-  /// KFintech's internal clientId for this issue's allotment lookup, resolved
-  /// once per issue by the sync job. Null when unmatched.
-  kfintechCompanyId String? @map("kfintech_company_id")
+  /// The registrar's own internal id for this issue's allotment lookup, whoever
+  /// the registrar turns out to be — KFintech's `clientId`, MUFG's dropdown
+  /// `company_id`, Bigshare's `<option value>`. One column rather than one per
+  /// registrar: an issue has exactly one registrar, so the old pair of columns
+  /// could only ever have one of them set anyway. Null when unmatched.
+  registrarCompanyId String? @map("registrar_company_id")
 
-  /// The same thing for MUFG Intime (ex-Link Intime) — their dropdown's
-  /// `company_id`, resolved on demand by the allotment check. Only one of the
-  /// two is ever set: an issue has one registrar. Null when unmatched, which is
-  /// also the state for every issue MUFG does not register.
-  mufgCompanyId String? @map("mufg_company_id")
+  /// Whose id `registrarCompanyId` is: KFINTECH, MUFG or BIGSHARE.
+  ///
+  /// Written only when the id was resolved from that registrar's own company
+  /// list, which makes it evidence rather than a label. That is what separates
+  /// it from `registrar` below, which is free-text display copy a user can type
+  /// on the manual-add form and whose column default is the bare string
+  /// 'KFintech' — a value most rows carry without anyone having checked.
+  registrarKey String? @map("registrar_key")
 
   source       String    @default("MANUAL")
   createdBy    String?   @map("created_by") @db.Uuid

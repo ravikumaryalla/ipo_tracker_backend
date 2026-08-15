@@ -722,10 +722,10 @@ async function applyRegistrars(
       const { count } = await prisma.ipo.updateMany({
         where: {
           id: { in: ids },
-          // KFintech listing an issue in its own allotment dropdown is direct
+          // A registrar listing an issue in its own allotment dropdown is direct
           // evidence of who the registrar is; ipogyani is a third party
           // reporting it. Where they disagree, the evidence wins.
-          kfintechCompanyId: null,
+          registrarCompanyId: null,
           // Load-bearing, and deliberately unlike syncKfintechCompanies, which
           // exempts itself from this filter (see the file header). That pass
           // only writes fields a user never types. `registrar` is one they do —
@@ -829,31 +829,11 @@ async function fetchGmp(): Promise<GmpReading[]> {
   return readings;
 }
 
-/**
- * The fast path the app's "Check status" button uses when an IPO has no
- * kfintech_company_id yet — just a KFintech re-match attempt, not the full
- * multi-provider scrape.
- */
-export async function syncKfintechOnly(): Promise<{ ok: boolean; outcomes: Outcome[] }> {
-  const log = jobLog('sync-kfintech');
-  log.start();
-
-  const outcome: Outcome = { provider: 'KFINTECH_MATCH', ok: false, rows: 0 };
-  const startedAt = Date.now();
-  try {
-    outcome.rows = await syncKfintechCompanies();
-    outcome.ok = true;
-  } catch (e) {
-    outcome.message = e instanceof Error ? e.message : String(e);
-  }
-  await logOutcome(outcome, log, Date.now() - startedAt);
-
-  log.done(
-    outcome.ok ? `${outcome.rows} matched` : `failed: ${outcome.message ?? 'unknown error'}`,
-    outcome.ok,
-  );
-  return { ok: outcome.ok, outcomes: [outcome] };
-}
+// `syncKfintechOnly` lived here: a KFintech-only re-match the app's "Check
+// status" button called before it was willing to check anything. Removed with
+// the client-side gate that needed it — the button now calls /allotments/check
+// directly, and checkAllotments.ts resolves against whichever registrar's list
+// is the right one rather than only ever KFintech's.
 
 export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> {
   const log = jobLog('sync-ipos');

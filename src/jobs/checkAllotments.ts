@@ -24,16 +24,22 @@
  * caller's id comes from the access token and the query filters on it directly,
  * so that whole dance collapses into a `where` clause — see routes/allotments.ts.
  *
- * TWO REGISTRARS. KFintech and MUFG Intime (ex-Link Intime) between them
- * register almost every issue in the book, and each answers only for its own.
- * Sending everything to KFintech — which is what this did until 2026-08-15 —
- * meant a MUFG issue answered 404 forever and its applications reported
- * "allotment not released yet" for good. `registrarFor` routes on the `ipos`
- * row's own registrar column, which the ipogyani feed already fills in.
+ * THREE REGISTRARS. KFintech, MUFG Intime (ex-Link Intime) and Bigshare between
+ * them register almost every issue in the book, and each answers only for its
+ * own. Sending everything to KFintech — which is what this did until 2026-08-15
+ * — meant a MUFG or Bigshare issue answered 404 forever and its applications
+ * reported "allotment not released yet" for good.
  *
- * The fallback is deliberate: an unrecognised or missing registrar goes to
- * KFintech rather than nowhere. Registrar strings come from a scraped feed and
- * a wrong one should cost a wasted request, not a permanently dead button.
+ * `companyIdFor` routes, and it trusts the `ipos.registrar_key` column above
+ * everything else: that column is only written after a match against a
+ * registrar's own company list, so it is evidence. The free-text `registrar`
+ * column is a hint that orders which list to try first, no more — it is a field
+ * on the manual-add form and its column default is the bare string 'KFintech',
+ * so most rows carry that name without anyone having checked.
+ *
+ * The fallback is deliberate: an unrecognised or missing registrar tries every
+ * list rather than nothing. Registrar strings come from a scraped feed and a
+ * wrong one should cost a wasted request, not a permanently dead button.
  *
  * A WORD OF WARNING, same as syncIpos: both endpoints below are undocumented,
  * reverse-engineered from the registrars' own frontends. They can change shape
@@ -53,6 +59,12 @@ import {
   pickMatch,
   statusFor,
 } from './checkAllotments.parse.js';
+import { parseBigshareAllotment } from './bigshare.parse.js';
+import {
+  BIGSHARE_REGISTRAR,
+  resolveBigshareCompanyId,
+  searchBigshareByPan,
+} from './bigshareCompanies.js';
 import { resolveKfintechCompanyId } from './kfintechCompanies.js';
 import { mufgMessage, parseMufgAllotment } from './mufg.parse.js';
 import { MUFG_REGISTRAR, resolveMufgCompanyId, searchMufgByPan } from './mufgCompanies.js';
@@ -68,8 +80,11 @@ const BROWSER_HEADERS = {
 const KFINTECH_QUERY_URL =
   'https://0uz601ms56.execute-api.ap-south-1.amazonaws.com/prod/api/query?type=pan';
 
-/** Who we ask. One per issue; `registrarFor` decides from the `ipos` row. */
-export type Registrar = 'KFINTECH' | 'MUFG';
+/** Who we ask. One per issue; `companyIdFor` decides from the `ipos` row. */
+export type Registrar = 'KFINTECH' | 'MUFG' | 'BIGSHARE';
+
+/** Every registrar we can actually query, in the order used as a last resort. */
+const REGISTRARS: readonly Registrar[] = ['KFINTECH', 'MUFG', 'BIGSHARE'];
 
 /** A candidate that has passed the null/due checks — every field we need is present. */
 export type DueRow = {
@@ -102,8 +117,8 @@ const candidateSelect = {
       id: true,
       companyName: true,
       registrar: true,
-      kfintechCompanyId: true,
-      mufgCompanyId: true,
+      registrarCompanyId: true,
+      registrarKey: true,
       allotmentDate: true,
     },
   },
@@ -119,87 +134,83 @@ type Candidate = {
     id: string;
     companyName: string;
     registrar: string | null;
-    kfintechCompanyId: string | null;
-    mufgCompanyId: string | null;
+    registrarCompanyId: string | null;
+    registrarKey: string | null;
     allotmentDate: Date | null;
   };
   dematAccount: { pan: string | null };
 };
 
 /**
- * The IPO's KFintech company id, resolving it against KFintech's own dropdown
- * if it has none yet.
- *
- * The scheduled match pass only runs once ever (see syncIpos.ts), so without
- * this an IPO added afterwards — or one whose name is spelled differently
- * enough that the old exact match missed it, "Milky Mist" against "MILKY MIST
- * DAIRY FOOD LIMITED" — would never acquire an id, and its "Check status"
- * button would report "allotment not released yet" forever regardless of what
- * KFintech actually had.
- *
- * Several applications in one batch routinely share an IPO; the company list is
- * cached in kfintechCompanies.ts so that costs one fetch, not one per row.
- */
-/**
- * Which registrar answers for this issue.
+ * Which registrar the free-text `registrar` column is naming, if any.
  *
  * Matched on the normalized name so every spelling the feeds publish lands in
  * one place — "MUFG Intime", "MUFG Intime India Pvt. Ltd.", and the retired
- * "Link Intime India Private Limited" are all the same company, and
+ * "Link Intime India Private Limited" are all the same company, as are
+ * "Bigshare Services Pvt. Ltd." and the no-space "Pvt.Ltd." variant.
  * `normalizeName` already strips the punctuation and the legal suffixes that
  * separate them (see ipogyani.ts's REGISTRARS table, which does the same).
  *
- * Anything else — including null — falls through to KFintech. That is the
- * fallback the file header describes: a registrar string is scraped data, and a
- * wrong one should cost one wasted request rather than a dead button.
+ * Returns null for anything it does not recognise, *including a bare
+ * 'KFintech'*. That string is the column's own default, so a row nobody has
+ * ever assigned a registrar to is indistinguishable by name from one KFintech
+ * genuinely registers — as of this writing 55 of 61 rows carry the default, and
+ * two of them (Lohia Corp, Indo-MIM) are sitting in MUFG's dropdown right now.
+ * A null here means "no hint", which `companyIdFor` answers by trying every
+ * list rather than by trusting the label.
  */
-export function registrarFor(registrar: string | null): Registrar {
+export function registrarFor(registrar: string | null): Registrar | null {
   const key = normalizeName(registrar ?? '');
-  return key.startsWith('mufg') || key.startsWith('linkintime') ? 'MUFG' : 'KFINTECH';
+  if (key.startsWith('mufg') || key.startsWith('linkintime')) return 'MUFG';
+  if (key.startsWith('bigshare')) return 'BIGSHARE';
+  return null;
 }
 
-/**
- * Whether the registrar column is actually telling us something.
- *
- * `ipos.registrar` defaults to the string 'KFintech' at the column level, so a
- * row nobody has ever assigned a registrar to is indistinguishable by name from
- * one KFintech genuinely registers — as of this writing 55 of 61 rows carry
- * that default, and two of them (Lohia Corp, Indo-MIM) are sitting in MUFG's
- * dropdown right now. A bare 'KFintech' with no resolved company id is
- * therefore treated as "unknown", not as evidence.
- */
-function registrarIsEvidence(ipo: Candidate['ipo']): boolean {
-  if (ipo.kfintechCompanyId || ipo.mufgCompanyId) return true;
-  return (
-    registrarFor(ipo.registrar) === 'MUFG' || normalizeName(ipo.registrar ?? '') !== 'kfintech'
-  );
+/** `registrar_key` as stored, validated back into the union. */
+function storedKey(key: string | null): Registrar | null {
+  return REGISTRARS.find((r) => r === key) ?? null;
 }
+
+/** Each registrar's on-demand "find this issue in your own list" resolver. */
+const RESOLVERS: Record<Registrar, (ipoId: string, name: string) => Promise<string | null>> = {
+  KFINTECH: resolveKfintechCompanyId,
+  MUFG: resolveMufgCompanyId,
+  BIGSHARE: resolveBigshareCompanyId,
+};
 
 /**
  * The registrar to ask and the company id to ask about, resolving the id
- * against that registrar's own dropdown if the issue has none yet.
+ * against the registrars' own dropdowns if the issue has none yet.
  *
  * Order of confidence:
- *   1. An id we already resolved — nothing beats having asked before.
- *   2. MUFG's dropdown, when the label says MUFG or says nothing usable. Their
- *      list holds only issues currently open for checking, so a hit is strong
- *      evidence on both counts: they register it, and the result is out.
- *   3. KFintech, which is both the genuine answer for most issues and the
- *      fallback for a registrar string that turned out to be wrong.
+ *   1. A stored `registrar_key` + `registrar_company_id` — nothing beats having
+ *      asked before, and that pair is only ever written after a real match.
+ *   2. The registrar the `registrar` column names, if it names one we can query.
+ *   3. Everyone else, in REGISTRARS order. This is what makes a wrong or absent
+ *      registrar string cost a couple of wasted list lookups instead of a
+ *      permanently dead button — and the lists are all cached for ten minutes,
+ *      so a batch pays for it once, not once per application.
+ *
+ * The resolvers persist their own match, so step 3 happens once per issue and
+ * every later check takes step 1.
  */
 async function companyIdFor(
   ipo: Candidate['ipo'],
 ): Promise<{ registrar: Registrar; companyId: string } | null> {
-  if (ipo.mufgCompanyId) return { registrar: 'MUFG', companyId: ipo.mufgCompanyId };
-  if (ipo.kfintechCompanyId) return { registrar: 'KFINTECH', companyId: ipo.kfintechCompanyId };
-
-  if (registrarFor(ipo.registrar) === 'MUFG' || !registrarIsEvidence(ipo)) {
-    const mufgId = await resolveMufgCompanyId(ipo.id, ipo.companyName);
-    if (mufgId) return { registrar: 'MUFG', companyId: mufgId };
+  const known = storedKey(ipo.registrarKey);
+  if (known && ipo.registrarCompanyId) {
+    return { registrar: known, companyId: ipo.registrarCompanyId };
   }
 
-  const kfinId = await resolveKfintechCompanyId(ipo.id, ipo.companyName);
-  return kfinId ? { registrar: 'KFINTECH', companyId: kfinId } : null;
+  const hinted = registrarFor(ipo.registrar);
+  const order = hinted ? [hinted, ...REGISTRARS.filter((r) => r !== hinted)] : REGISTRARS;
+
+  for (const registrar of order) {
+    const companyId = await RESOLVERS[registrar](ipo.id, ipo.companyName);
+    if (companyId) return { registrar, companyId };
+  }
+
+  return null;
 }
 
 /**
@@ -255,9 +266,24 @@ async function askMufg(row: DueRow): Promise<AllotmentMatch[] | null> {
   return parseMufgAllotment(xml);
 }
 
+/**
+ * Ask Bigshare. The simplest of the three: one POST, and "nothing on file"
+ * arrives as `DPID: "No data found"` inside an HTTP 200 — see
+ * parseBigshareAllotment, which also handles their non-numeric "NON-ALLOTTE".
+ */
+async function askBigshare(row: DueRow): Promise<AllotmentMatch[] | null> {
+  return parseBigshareAllotment(await searchBigshareByPan(row.companyId, row.pan));
+}
+
+const ASK: Record<Registrar, (row: DueRow) => Promise<AllotmentMatch[] | null>> = {
+  KFINTECH: askKfintech,
+  MUFG: askMufg,
+  BIGSHARE: askBigshare,
+};
+
 async function checkOne(row: DueRow): Promise<CheckResult> {
   try {
-    const matches = row.registrar === 'MUFG' ? await askMufg(row) : await askKfintech(row);
+    const matches = await ASK[row.registrar](row);
     if (!matches) {
       await touchCheckedAt([row.id]);
       return { row, outcome: 'not-yet' };
@@ -288,8 +314,13 @@ async function checkOne(row: DueRow): Promise<CheckResult> {
 const isoDay = (d: Date): string => d.toISOString().slice(0, 10);
 
 /** How a registrar is named in text a user reads. */
-const registrarLabel = (registrar: Registrar): string =>
-  registrar === 'MUFG' ? MUFG_REGISTRAR : 'KFintech';
+const LABELS: Record<Registrar, string> = {
+  KFINTECH: 'KFintech',
+  MUFG: MUFG_REGISTRAR,
+  BIGSHARE: BIGSHARE_REGISTRAR,
+};
+
+const registrarLabel = (registrar: Registrar): string => LABELS[registrar];
 
 function toDueRow(
   c: Candidate,
@@ -308,30 +339,42 @@ function toDueRow(
   };
 }
 
+/** One registrar's rows, strictly one at a time. */
+async function checkInSeries(rows: DueRow[]): Promise<CheckResult[]> {
+  const out: CheckResult[] = [];
+  for (const row of rows) out.push(await checkOne(row));
+  return out;
+}
+
 /**
  * Run a batch, respecting what each registrar can take.
  *
  * KFintech keeps the unbounded fan-out it has always had — it is an API gateway
- * fronting a real API and has never objected. MUFG goes one at a time: it is a
- * single ASP.NET page, each search costs two round trips because the nonce is
- * single-use, and a burst from one IP is exactly the shape a rate limiter
- * exists to stop. The two groups still run concurrently with each other, so a
- * slow MUFG queue never delays a KFintech result.
+ * fronting a real API and has never objected. MUFG and Bigshare go one at a
+ * time: both are single ASP.NET pages rather than APIs (and MUFG's search costs
+ * two round trips besides, because its nonce is single-use), and a burst from
+ * one IP is exactly the shape a rate limiter exists to stop.
+ *
+ * The three groups still run concurrently with each other, so a slow queue at
+ * one registrar never delays another's result.
  */
 async function checkAll(rows: DueRow[]): Promise<CheckResult[]> {
-  const mufg = rows.filter((r) => r.registrar === 'MUFG');
-  const kfintech = rows.filter((r) => r.registrar !== 'MUFG');
+  const of = (registrar: Registrar) => rows.filter((r) => r.registrar === registrar);
 
-  const [kfinResults, mufgResults] = await Promise.all([
-    Promise.all(kfintech.map(checkOne)),
-    (async () => {
-      const out: CheckResult[] = [];
-      for (const row of mufg) out.push(await checkOne(row));
-      return out;
-    })(),
+  const [kfinResults, mufgResults, bigshareResults] = await Promise.all([
+    Promise.all(of('KFINTECH').map(checkOne)),
+    checkInSeries(of('MUFG')),
+    checkInSeries(of('BIGSHARE')),
   ]);
 
-  return [...kfinResults, ...mufgResults];
+  return [...kfinResults, ...mufgResults, ...bigshareResults];
+}
+
+/** "3 KFintech, 1 MUFG, 0 Bigshare" — the sweep's log and sync_log line. */
+function tallyByRegistrar(rows: DueRow[]): string {
+  return REGISTRARS.map(
+    (r) => `${rows.filter((row) => row.registrar === r).length} ${LABELS[r]}`,
+  ).join(', ');
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +390,7 @@ export async function sweepAllotments(): Promise<SweepSummary> {
   let ok = true;
   let checked = 0;
   let resolved = 0;
-  let byRegistrar = '0 KFintech, 0 MUFG';
+  let byRegistrar = tallyByRegistrar([]);
   const errors: string[] = [];
 
   try {
@@ -372,9 +415,7 @@ export async function sweepAllotments(): Promise<SweepSummary> {
       due.push(toDueRow(c, resolvedTo, pan));
     }
 
-    byRegistrar = `${due.filter((d) => d.registrar !== 'MUFG').length} KFintech, ${
-      due.filter((d) => d.registrar === 'MUFG').length
-    } MUFG`;
+    byRegistrar = tallyByRegistrar(due);
     log.note(`${candidates.length} applied, ${due.length} due (${byRegistrar})`);
 
     const results = await checkAll(due);
@@ -402,8 +443,8 @@ export async function sweepAllotments(): Promise<SweepSummary> {
   }
 
   // The provider tag stays KFINTECH_ALLOTMENT_CHECK even though the sweep now
-  // covers two registrars: the app's staleness banner keys on this exact string,
-  // and renaming it would read as "the allotment check has never run".
+  // covers three registrars: the app's staleness banner keys on this exact
+  // string, and renaming it would read as "the allotment check has never run".
   await prisma.syncLog.create({
     data: {
       provider: 'KFINTECH_ALLOTMENT_CHECK',

@@ -46,7 +46,8 @@ describe('ipoRow', () => {
     currentPrice: null,
     registrar: 'KFintech',
     registrarUrl: 'https://ipostatus.kfintech.com/',
-    kfintechCompanyId: null,
+    registrarCompanyId: null,
+    registrarKey: null,
     source: 'NSE',
     createdBy: null,
     lastSyncedAt: new Date('2026-08-14T09:30:00.000Z'),
@@ -79,7 +80,7 @@ describe('ipoRow', () => {
   it('uses the snake_case keys the app declares', () => {
     const row = ipoRow(base);
     expect(row).toHaveProperty('company_name', 'Test Co');
-    expect(row).toHaveProperty('kfintech_company_id', null);
+    expect(row).toHaveProperty('registrar_company_id', null);
     expect(row).not.toHaveProperty('companyName');
   });
 });

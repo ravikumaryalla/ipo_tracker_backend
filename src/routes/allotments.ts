@@ -1,22 +1,27 @@
 /**
- * The app's "Check status" button.
+ * The app's "Check status" button, and the whole of it.
  *
- * `/check` asks whichever registrar handles each application's issue — KFintech
- * or MUFG Intime; checkAllotments.ts routes it. `/sync-kfintech` is narrower
- * than its name suggests only in that MUFG needs no equivalent: its company ids
- * are resolved on demand inside the check itself.
+ * `/check` asks whichever registrar handles each application's issue — KFintech,
+ * MUFG Intime or Bigshare; checkAllotments.ts routes it, resolving the issue's
+ * company id against each registrar's own list on the way if it has none yet.
  *
- * Both endpoints were Edge Function invocations before. The ownership check
- * that `check-allotments` had to do by hand — build a second Supabase client
- * from the caller's JWT, resolve the user, filter the requested ids — is now
- * just the `userId` argument below, because nothing here runs with a
- * RLS-bypassing key in the first place.
+ * There used to be a second endpoint here, `/sync-kfintech`, because the client
+ * pre-checked for a `kfintech_company_id` before it was willing to call `/check`
+ * at all. That gate is gone: it could only ever be satisfied by KFintech, so it
+ * silently disabled the button for every MUFG issue and would have done the same
+ * for every Bigshare one. The client now always calls `/check` and lets the
+ * resolution happen here, where all three lists are.
+ *
+ * This was an Edge Function invocation before. The ownership check that
+ * `check-allotments` had to do by hand — build a second Supabase client from the
+ * caller's JWT, resolve the user, filter the requested ids — is now just the
+ * `userId` argument below, because nothing here runs with a RLS-bypassing key in
+ * the first place.
  */
 import { Router } from 'express';
 import { z } from 'zod';
 
 import { checkApplications } from '../jobs/checkAllotments.js';
-import { syncKfintechOnly } from '../jobs/syncIpos.js';
 import { requireAuth, userId } from '../middleware/auth.js';
 import { asyncHandler } from '../util/asyncHandler.js';
 
@@ -32,18 +37,5 @@ allotmentsRouter.post(
 
     const results = await checkApplications(userId(req), body.applicationIds);
     res.json({ ok: true, results });
-  }),
-);
-
-/**
- * A KFintech re-match for an IPO whose company id has not been resolved yet.
- * Scrapes only public data — no PAN, no user rows — so any signed-in caller may
- * trigger it, exactly as the `{ onlyKfintech: true }` Edge Function branch did.
- */
-allotmentsRouter.post(
-  '/sync-kfintech',
-  asyncHandler(async (_req, res) => {
-    const result = await syncKfintechOnly();
-    res.status(result.ok ? 200 : 502).json(result);
   }),
 );
