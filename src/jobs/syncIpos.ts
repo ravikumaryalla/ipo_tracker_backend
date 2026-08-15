@@ -16,11 +16,18 @@
  * and `sync_log` — it must never touch user data. Every write below filters on
  * `createdBy: null` for exactly that reason, with one narrow, intentional
  * exception: `syncKfintechCompanies` also matches against manually-added IPOs
- * and may write kfintech_company_id/registrar/registrar_url onto one. That is
- * safe to exempt because it only ever sets those three additive fields, never
- * anything the user actually typed (name, dates, price band, lot size), and only
- * on an unambiguous exact company-name match — a manually-added IPO would
- * otherwise never get a KFintech match at all.
+ * and may write kfintech_company_id/registrar/registrar_url onto one (via
+ * `saveKfintechMatch`). That is safe to exempt because it only ever sets those
+ * three additive fields, never anything the user actually typed (name, dates,
+ * price band, lot size) — a manually-added IPO would otherwise never get a
+ * KFintech match at all.
+ *
+ * That match used to require exact company-name equality. It no longer does:
+ * KFintech writes full legal names ("MILKY MIST DAIRY FOOD LIMITED") where the
+ * IPO feeds publish short trading names ("Milky Mist"), and exact equality left
+ * those issues with no company id and a permanently dead "Check status" button.
+ * `resolveKfintechCompanyMatch` now falls through to a scored name match — see
+ * the fuzzy-matching section of syncIpos.parse.ts for what keeps that narrow.
  *
  * KNOWN GAP, carried over unchanged: `ipos_symbol_open_idx` is a global unique
  * index on (symbol, open_date), not scoped by created_by. If a user manually
@@ -48,6 +55,7 @@ import {
   type RegistrarAssignment,
   registrarAssignments,
 } from './ipogyani.js';
+import { getKfintechCompanies, saveKfintechMatch } from './kfintechCompanies.js';
 import {
   buildIpoIndexes,
   type GmpReading,
@@ -61,7 +69,6 @@ import {
   parseDate,
   parseIpowatchGmpTable,
   parseIpowatchListingTable,
-  parseKfintechCompanies,
   parsePriceBand,
   resolveIpoId,
   resolveKfintechCompanyMatch,
@@ -654,29 +661,6 @@ async function applyRegistrars(
 // jobs/checkAllotments.ts and never runs here.
 // ---------------------------------------------------------------------------
 
-const KFINTECH_BASE = 'https://ipostatus.kfintech.com';
-
-async function fetchKfintechCompanies() {
-  const homepage = await fetch(`${KFINTECH_BASE}/`, { headers: BROWSER_HEADERS });
-  if (!homepage.ok) throw new Error(`KFintech homepage responded ${homepage.status}`);
-  const html = await homepage.text();
-
-  // KFintech has served this as both "/static/js/main.<hash>.js" and, since
-  // 2026-08, "./static/js/main.<hash>.js" — tolerate either leading form and
-  // always rebuild the URL with a single slash rather than trusting whichever
-  // one shows up.
-  const scriptMatch = html.match(/src="\.?\/?(static\/js\/main\.[a-z0-9]+\.js)"/);
-  if (!scriptMatch) throw new Error('KFintech homepage did not reference a main.<hash>.js bundle');
-
-  const bundleRes = await fetch(`${KFINTECH_BASE}/${scriptMatch[1]}`, { headers: BROWSER_HEADERS });
-  if (!bundleRes.ok) throw new Error(`KFintech bundle responded ${bundleRes.status}`);
-  const bundle = await bundleRes.text();
-
-  const companies = parseKfintechCompanies(bundle);
-  if (companies.length === 0) throw new Error('KFintech bundle yielded no company entries');
-  return companies;
-}
-
 /**
  * The registrar/company-id match barely changes once made, so the schedule only
  * needs to run it once ever, not on every tick — gate on whether a successful
@@ -688,7 +672,7 @@ async function hasSucceededBefore(provider: string): Promise<boolean> {
 }
 
 export async function syncKfintechCompanies(): Promise<number> {
-  const companies = await fetchKfintechCompanies();
+  const companies = await getKfintechCompanies();
   const indexes = await loadIpoIndexes({ includeManual: true });
 
   let matched = 0;
@@ -696,18 +680,7 @@ export async function syncKfintechCompanies(): Promise<number> {
     const id = resolveKfintechCompanyMatch(company, indexes);
     if (!id) continue;
     try {
-      // Deliberately not filtered on `createdBy: null` — see the file header.
-      await prisma.ipo.update({
-        where: { id },
-        data: {
-          // Spelled the same way resolveRegistrar spells it — this column is
-          // rendered straight into "Check allotment at …" on the IPO screen, and
-          // two spellings would show up as two different registrars.
-          registrar: 'KFintech',
-          registrarUrl: `${KFINTECH_BASE}/`,
-          kfintechCompanyId: company.clientId,
-        },
-      });
+      await saveKfintechMatch(id, company.clientId);
       matched += 1;
     } catch {
       // One unmatched/deleted row must not stop the rest.

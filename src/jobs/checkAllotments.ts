@@ -40,6 +40,7 @@ import {
   pickMatch,
   statusFor,
 } from './checkAllotments.parse.js';
+import { resolveKfintechCompanyId } from './kfintechCompanies.js';
 import { sendAllotmentPushes } from './push.js';
 
 const BROWSER_HEADERS = {
@@ -76,7 +77,9 @@ const candidateSelect = {
   userId: true,
   sharesApplied: true,
   applicationNo: true,
-  ipo: { select: { companyName: true, kfintechCompanyId: true, allotmentDate: true } },
+  ipo: {
+    select: { id: true, companyName: true, kfintechCompanyId: true, allotmentDate: true },
+  },
   dematAccount: { select: { pan: true } },
 } as const;
 
@@ -85,9 +88,33 @@ type Candidate = {
   userId: string;
   sharesApplied: number;
   applicationNo: string | null;
-  ipo: { companyName: string; kfintechCompanyId: string | null; allotmentDate: Date | null };
+  ipo: {
+    id: string;
+    companyName: string;
+    kfintechCompanyId: string | null;
+    allotmentDate: Date | null;
+  };
   dematAccount: { pan: string | null };
 };
+
+/**
+ * The IPO's KFintech company id, resolving it against KFintech's own dropdown
+ * if it has none yet.
+ *
+ * The scheduled match pass only runs once ever (see syncIpos.ts), so without
+ * this an IPO added afterwards — or one whose name is spelled differently
+ * enough that the old exact match missed it, "Milky Mist" against "MILKY MIST
+ * DAIRY FOOD LIMITED" — would never acquire an id, and its "Check status"
+ * button would report "allotment not released yet" forever regardless of what
+ * KFintech actually had.
+ *
+ * Several applications in one batch routinely share an IPO; the company list is
+ * cached in kfintechCompanies.ts so that costs one fetch, not one per row.
+ */
+async function companyIdFor(ipo: Candidate['ipo']): Promise<string | null> {
+  if (ipo.kfintechCompanyId) return ipo.kfintechCompanyId;
+  return resolveKfintechCompanyId(ipo.id, ipo.companyName);
+}
 
 /**
  * Stamp allotment_checked_at without touching status/shares_allotted.
@@ -184,11 +211,16 @@ export async function sweepAllotments(): Promise<SweepSummary> {
 
     const due: DueRow[] = [];
     for (const c of candidates) {
-      const companyId = c.ipo.kfintechCompanyId;
       const allotmentDate = c.ipo.allotmentDate;
       const pan = c.dematAccount.pan;
-      if (!companyId || !allotmentDate || !pan) continue;
+      if (!allotmentDate || !pan) continue;
+      // The due-date gate is checked before the company id is resolved, not
+      // after: resolving can reach out to KFintech, and a sweep runs every 15
+      // minutes over every outstanding application. Gating first keeps that
+      // lookup to the rows actually about to be checked.
       if (!isAllotmentCheckDue(isoDay(allotmentDate), nowIso)) continue;
+      const companyId = await companyIdFor(c.ipo);
+      if (!companyId) continue;
       due.push(toDueRow(c, companyId, pan));
     }
 
@@ -258,8 +290,8 @@ export async function checkApplications(
   const rejected: string[] = [];
 
   for (const c of candidates) {
-    const companyId = c.ipo.kfintechCompanyId;
     const pan = c.dematAccount.pan;
+    const companyId = await companyIdFor(c.ipo);
 
     if (!companyId) {
       rejected.push(c.id);

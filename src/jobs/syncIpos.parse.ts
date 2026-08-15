@@ -183,6 +183,29 @@ export function symbolFromSlug(slug: unknown): string {
 const NAME_NOISE = /\b(ltd|limited|pvt|private|india|indian|the|inc|corp|corporation|company|co)\b/g;
 
 /**
+ * The significant words of a company name, noise stripped.
+ *
+ * "Q & T Foods Ltd. IPO" → ["q", "and", "t", "foods"].
+ *
+ * This is `normalizeName`'s pipeline stopped one step early, before the tokens
+ * are welded into a single key. Exact matching wants the welded key; the fuzzy
+ * pass in `nameMatchScore` needs the word boundaries that welding destroys —
+ * "Milky Mist" and "MILKY MIST DAIRY FOOD LIMITED" share two whole words, but
+ * as dense keys (`milkymist` / `milkymistdairyfood`) they are just two unequal
+ * strings.
+ */
+export function nameTokens(name: unknown): string[] {
+  return decodeEntities(String(name ?? ''))
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\bipo\b/g, ' ')
+    .replace(NAME_NOISE, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
  * Collapses the many spellings of one company to a single key, so the two feeds
  * can be joined by name when the slug bridge is unavailable.
  *
@@ -190,13 +213,145 @@ const NAME_NOISE = /\b(ltd|limited|pvt|private|india|indian|the|inc|corp|corpora
  * "Q and T Foods Private Limited" must all produce the same string.
  */
 export function normalizeName(name: unknown): string {
-  return decodeEntities(String(name ?? ''))
-    .toLowerCase()
-    .replace(/&/g, ' and ')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\bipo\b/g, ' ')
-    .replace(NAME_NOISE, ' ')
-    .replace(/[^a-z0-9]/g, '');
+  return nameTokens(name).join('');
+}
+
+// ---------------------------------------------------------------------------
+// fuzzy name matching
+//
+// The registrar writes a company's full legal name ("MILKY MIST DAIRY FOOD
+// LIMITED"); we hold whatever the IPO feeds published, which is routinely the
+// short trading name ("Milky Mist"). Exact key equality never joins those two.
+//
+// The measure below is deliberately *directional* — what fraction of OUR words
+// the registrar's name accounts for — rather than a symmetric string-similarity
+// ratio. A ratio penalises the registrar for the extra legal words it is
+// obliged to carry: "milkymist" against "milkymistdairyfood" scores ~50% on a
+// Levenshtein ratio and ~64% on a Dice bigram coefficient, so an 80% bar on
+// either would reject the exact pair this exists to accept. Two of our two
+// words appear verbatim on their side, which is the relationship that actually
+// holds, and it scores 100%.
+// ---------------------------------------------------------------------------
+
+/** Minimum share of our tokens the registrar's name must account for. */
+export const NAME_MATCH_THRESHOLD = 0.8;
+
+/**
+ * Total characters that must be covered before a score counts at all.
+ *
+ * Without this, a two-letter company name is one token long, so a single
+ * incidental hit is 1/1 = 100% and it matches the first registrar entry that
+ * happens to contain that fragment. Five characters is the shortest span that
+ * is plausibly a company rather than a coincidence.
+ */
+const MIN_COVERED_CHARS = 5;
+
+/**
+ * Registrar entries for instruments we never track. KFintech's dropdown mixes
+ * these in with equity IPOs, and their names are the issuer's name plus a
+ * suffix — so "POWER FINANCE CORPORATION LIMITED - NCDS" covers every token of
+ * a "Power Finance Corporation" equity row and scores a clean 100%.
+ *
+ * Under exact matching that entry was excluded by accident, because the trailing
+ * "NCDS" made the dense keys unequal. Fuzzy matching removes that accident, so
+ * the exclusion has to become deliberate.
+ */
+const NON_EQUITY_TOKENS = new Set([
+  'ncd',
+  'ncds',
+  'bond',
+  'bonds',
+  'debenture',
+  'debentures',
+  'rights',
+]);
+
+/**
+ * Skip a registrar entry that is marked as a non-equity instrument unless our
+ * own name carries the same marker — a user who manually added an NCD should
+ * still be able to match it, they just must not have one attached to their
+ * equity application by accident.
+ */
+function skipNonEquity(ours: string[], theirs: string[]): boolean {
+  const theirsIsDebt = theirs.some((token) => NON_EQUITY_TOKENS.has(token));
+  if (!theirsIsDebt) return false;
+  return !ours.some((token) => NON_EQUITY_TOKENS.has(token));
+}
+
+/**
+ * A token counts as covered by an exact word hit, or by appearing anywhere in
+ * the other side's welded key.
+ *
+ * The welded fallback is what handles the two sources disagreeing about where
+ * the spaces go — "Electro Systems" against "ELECTROSYSTEMS HOLDINGS" shares no
+ * whole word at all, yet both our words sit inside `electrosystemsholdings`.
+ * It is gated at four characters because shorter fragments appear inside almost
+ * anything ("in" is inside "industries", "infra", "international") and would
+ * turn the threshold into a formality.
+ */
+function isCovered(token: string, candidates: string[], candidatesDense: string): boolean {
+  for (const candidate of candidates) if (candidate === token) return true;
+  return token.length >= 4 && candidatesDense.includes(token);
+}
+
+/**
+ * `score` is the share of `ours` covered; `extra` is how many of `theirs` went
+ * unused. `extra` is only ever a tie-breaker — between two entries that cover
+ * our name equally well, the one carrying fewer unrelated words is the closer
+ * name, which is what separates "MILKY MIST DAIRY FOOD LIMITED" from a
+ * hypothetical "MILKY MIST DAIRY FOOD AND BEVERAGES HOLDINGS LIMITED".
+ */
+type TokenMatch = { score: number; extra: number };
+
+function scoreTokens(ours: string[], theirs: string[]): TokenMatch {
+  if (ours.length === 0 || theirs.length === 0) return { score: 0, extra: 0 };
+
+  const oursDense = ours.join('');
+  const theirsDense = theirs.join('');
+
+  let covered = 0;
+  let coveredChars = 0;
+  for (const token of ours) {
+    if (!isCovered(token, theirs, theirsDense)) continue;
+    covered += 1;
+    coveredChars += token.length;
+  }
+
+  if (coveredChars < MIN_COVERED_CHARS) return { score: 0, extra: 0 };
+
+  let unused = 0;
+  for (const token of theirs) if (!isCovered(token, ours, oursDense)) unused += 1;
+
+  return { score: covered / ours.length, extra: unused };
+}
+
+/**
+ * Strictly closer: a higher score, or the same score reached while dragging in
+ * fewer unrelated words.
+ *
+ * Note what this deliberately cannot express — a *dead* tie, equal on both
+ * counts. Callers treat that as no match rather than taking whichever the
+ * iteration order happened to reach first. Preferring the best scorer over a
+ * near-miss is a judgement call worth making; preferring one of two
+ * indistinguishable companies is a coin flip, and the losing side of it shows a
+ * stranger's allotment result on the user's own application.
+ */
+function isBetter(match: TokenMatch, best: TokenMatch): boolean {
+  if (match.score !== best.score) return match.score > best.score;
+  return match.extra < best.extra;
+}
+
+/**
+ * 0..1 — the share of `ipoName`'s significant words that `registrarName`
+ * accounts for. 1 whenever the two normalise to the same key, so exact matches
+ * always sit at the top of the ladder.
+ */
+export function nameMatchScore(ipoName: unknown, registrarName: unknown): number {
+  const ours = nameTokens(ipoName);
+  const theirs = nameTokens(registrarName);
+  if (ours.length === 0 || theirs.length === 0) return 0;
+  if (ours.join('') === theirs.join('')) return 1;
+  return scoreTokens(ours, theirs).score;
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +768,14 @@ export type IpoIndexes = {
   byNameOpen: Map<string, string>;
   /** normalizeName → every candidate, for the fuzzy date pass. */
   byName: Map<string, { id: string; open_date: string | null }[]>;
+  /**
+   * Every candidate with its words intact, for the fuzzy *name* pass.
+   *
+   * A flat list rather than a Map because there is no key to look up by — the
+   * fuzzy pass has to score every candidate. That is affordable: the pool is
+   * only the IPOs within the ±45 day match window, which is dozens of rows.
+   */
+  byTokens: { id: string; tokens: string[] }[];
 };
 
 export function buildIpoIndexes(
@@ -622,15 +785,18 @@ export function buildIpoIndexes(
     bySymbolOpen: new Map(),
     byNameOpen: new Map(),
     byName: new Map(),
+    byTokens: [],
   };
 
   for (const row of rows) {
-    const name = normalizeName(row.company_name);
+    const tokens = nameTokens(row.company_name);
+    const name = tokens.join('');
     indexes.bySymbolOpen.set(`${row.symbol.toUpperCase()}|${row.open_date}`, row.id);
     indexes.byNameOpen.set(`${name}|${row.open_date}`, row.id);
     const bucket = indexes.byName.get(name);
     if (bucket) bucket.push({ id: row.id, open_date: row.open_date });
     else indexes.byName.set(name, [{ id: row.id, open_date: row.open_date }]);
+    indexes.byTokens.push({ id: row.id, tokens });
   }
 
   return indexes;
@@ -735,19 +901,84 @@ export function parseKfintechCompanies(bundleSource: string): KfintechCompany[] 
  *
  * KFintech's list carries no open date and no exchange symbol, and it mixes
  * equity IPOs with NCDs/bonds we never track — so name is the only signal
- * available. Same refusal rule as `resolveIpoId`: an unmatched or ambiguous
- * name is left alone rather than guessed at, since a wrong match would show
- * one company's allotment status on another's application.
+ * available. The ladder is exact-first, then fuzzy:
+ *
+ *   1. An unambiguous exact key match, exactly as before.
+ *   2. The best `nameMatchScore` at or above the threshold.
+ *
+ * Rung 2 deliberately takes the highest scorer rather than refusing on a tie,
+ * which is the opposite of what `resolveIpoId` and `pickMatch` do. That is a
+ * considered trade-off, not an oversight: those two can afford to refuse
+ * because an unattached GMP reading is retried on the next run, whereas an
+ * unmatched company id is a dead "Check status" button with no path forward.
+ * The threshold, the covered-character floor and the non-equity filter are what
+ * keep the guess narrow.
  */
 export function resolveKfintechCompanyMatch(
   company: KfintechCompany,
   indexes: IpoIndexes,
 ): string | null {
-  const name = normalizeName(company.name);
-  if (!name) return null;
+  const theirs = nameTokens(company.name);
+  if (theirs.length === 0) return null;
 
-  const candidates = indexes.byName.get(name);
+  const candidates = indexes.byName.get(theirs.join(''));
   if (candidates && candidates.length === 1) return candidates[0].id;
 
-  return null;
+  let best: { id: string; score: number; extra: number } | null = null;
+  let tied = false;
+  for (const candidate of indexes.byTokens) {
+    if (skipNonEquity(candidate.tokens, theirs)) continue;
+    const match = scoreTokens(candidate.tokens, theirs);
+    if (match.score < NAME_MATCH_THRESHOLD) continue;
+    if (best && isBetter(match, best)) {
+      best = { id: candidate.id, score: match.score, extra: match.extra };
+      tied = false;
+    } else if (best) {
+      if (match.score === best.score && match.extra === best.extra) tied = true;
+    } else {
+      best = { id: candidate.id, score: match.score, extra: match.extra };
+    }
+  }
+
+  return best && !tied ? best.id : null;
+}
+
+/**
+ * The same match run the other way round: one of our IPO names against the
+ * whole KFintech dropdown.
+ *
+ * `resolveKfintechCompanyMatch` is the bulk direction — walk their list, find
+ * our row. This is the on-demand direction, for the "Check status" button,
+ * which has exactly one IPO in hand and needs the `clientId` its allotment API
+ * wants. Same ladder, same guards, same take-the-best tie-breaking.
+ */
+export function matchKfintechCompanyByName(
+  ipoName: string,
+  companies: KfintechCompany[],
+): KfintechCompany | null {
+  const ours = nameTokens(ipoName);
+  if (ours.length === 0) return null;
+  const dense = ours.join('');
+
+  let best: { company: KfintechCompany; score: number; extra: number } | null = null;
+  let tied = false;
+  for (const company of companies) {
+    const theirs = nameTokens(company.name);
+    if (theirs.length === 0) continue;
+    if (theirs.join('') === dense) return company;
+    if (skipNonEquity(ours, theirs)) continue;
+
+    const match = scoreTokens(ours, theirs);
+    if (match.score < NAME_MATCH_THRESHOLD) continue;
+    if (best && isBetter(match, best)) {
+      best = { company, score: match.score, extra: match.extra };
+      tied = false;
+    } else if (best) {
+      if (match.score === best.score && match.extra === best.extra) tied = true;
+    } else {
+      best = { company, score: match.score, extra: match.extra };
+    }
+  }
+
+  return best && !tied ? best.company : null;
 }

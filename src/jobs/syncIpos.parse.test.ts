@@ -22,7 +22,10 @@ import {
   type IpowatchIpoDetail,
   ipowatchObservedAtFrom,
   type IpowatchListingRow,
+  matchKfintechCompanyByName,
   mergeIpowatchDetail,
+  nameMatchScore,
+  nameTokens,
   normalizeName,
   parseDate,
   parseIpowatchAmount,
@@ -202,6 +205,49 @@ describe('parseKfintechCompanies', () => {
   });
 });
 
+describe('nameTokens', () => {
+  it('is normalizeName one step early — the tokens weld back into the same key', () => {
+    expect(nameTokens('Q & T Foods Ltd. IPO')).toEqual(['q', 'and', 't', 'foods']);
+    expect(nameTokens('Q & T Foods Ltd. IPO').join('')).toBe(normalizeName('Q & T Foods Ltd. IPO'));
+  });
+
+  it('yields nothing for a name that is entirely noise', () => {
+    expect(nameTokens('The India Company Limited IPO')).toEqual([]);
+  });
+});
+
+describe('nameMatchScore', () => {
+  it('scores the short trading name against the full legal name', () => {
+    // The case this whole fuzzy pass exists for. Both of our words appear
+    // verbatim on KFintech's side; the extra legal words cost nothing.
+    expect(nameMatchScore('Milky Mist', 'MILKY MIST DAIRY FOOD LIMITED')).toBe(1);
+  });
+
+  it('is 1 for names that normalise identically', () => {
+    expect(nameMatchScore('MV Electrosystems Ltd.', 'MV ELECTROSYSTEMS LIMITED')).toBe(1);
+  });
+
+  it('falls below the threshold when a word is genuinely different', () => {
+    // "milky" hits, "mist" does not — 1 of 2, well under 0.8.
+    expect(nameMatchScore('Milky Mist', 'MILKY WAY BEVERAGES LIMITED')).toBe(0.5);
+  });
+
+  it('accepts a prefix of four characters or more', () => {
+    expect(nameMatchScore('Electro Systems', 'ELECTROSYSTEMS HOLDINGS LIMITED')).toBe(1);
+  });
+
+  it('refuses to build a score out of fragments shorter than the character floor', () => {
+    // "mv" alone is two covered characters. Without the floor this would be
+    // 1/1 = 100% against any name containing an "mv" word.
+    expect(nameMatchScore('MV', 'MV ELECTROSYSTEMS LIMITED')).toBe(0);
+  });
+
+  it('is 0 when either side is entirely noise', () => {
+    expect(nameMatchScore('', 'MILKY MIST DAIRY FOOD LIMITED')).toBe(0);
+    expect(nameMatchScore('Milky Mist', 'The Limited Company')).toBe(0);
+  });
+});
+
 describe('resolveKfintechCompanyMatch', () => {
   const indexes = buildIpoIndexes([
     { id: 'ipo-mv', symbol: 'MVELEC', company_name: 'MV Electrosystems Ltd.', open_date: '2026-08-01' },
@@ -211,6 +257,15 @@ describe('resolveKfintechCompanyMatch', () => {
   it('matches an unambiguous company by name alone, with no open date available', () => {
     const company = { clientId: '44065980180', name: 'MV ELECTROSYSTEMS LIMITED' };
     expect(resolveKfintechCompanyMatch(company, indexes)).toBe('ipo-mv');
+  });
+
+  it('matches a full legal name against the short name we hold', () => {
+    const milky = buildIpoIndexes([
+      { id: 'ipo-milky', symbol: 'MILKY', company_name: 'Milky Mist', open_date: '2026-08-20' },
+      { id: 'ipo-ship', symbol: 'SHIPROCKET', company_name: 'Shiprocket Ltd.', open_date: '2026-08-12' },
+    ]);
+    const company = { clientId: '99', name: 'MILKY MIST DAIRY FOOD LIMITED' };
+    expect(resolveKfintechCompanyMatch(company, milky)).toBe('ipo-milky');
   });
 
   it('refuses to guess when two ipos rows share a normalised name', () => {
@@ -226,6 +281,65 @@ describe('resolveKfintechCompanyMatch', () => {
   it('returns null for an NCD/bond entry with no matching equity IPO', () => {
     const company = { clientId: '64562521850', name: 'POWER FINANCE CORPORATION LIMITED - NCDS' };
     expect(resolveKfintechCompanyMatch(company, indexes)).toBeNull();
+  });
+
+  it('still skips an NCD entry when the issuer IS one of our equity rows', () => {
+    // Under exact matching the trailing "NCDS" made the keys unequal and this
+    // was excluded by accident. Fuzzy matching covers every one of our tokens,
+    // so the exclusion has to be deliberate or the bond gets attached to the
+    // equity application.
+    const withIssuer = buildIpoIndexes([
+      {
+        id: 'ipo-pfc',
+        symbol: 'PFC',
+        company_name: 'Power Finance Corporation',
+        open_date: '2026-08-05',
+      },
+    ]);
+    const ncd = { clientId: '64562521850', name: 'POWER FINANCE CORPORATION LIMITED - NCDS' };
+    expect(resolveKfintechCompanyMatch(ncd, withIssuer)).toBeNull();
+  });
+});
+
+describe('matchKfintechCompanyByName', () => {
+  const companies = [
+    { clientId: '1', name: 'MV ELECTROSYSTEMS LIMITED' },
+    { clientId: '2', name: 'MILKY MIST DAIRY FOOD LIMITED' },
+    { clientId: '3', name: 'POWER FINANCE CORPORATION LIMITED - NCDS' },
+  ];
+
+  it('resolves the short name the app holds to the registrar entry', () => {
+    expect(matchKfintechCompanyByName('Milky Mist', companies)).toEqual({
+      clientId: '2',
+      name: 'MILKY MIST DAIRY FOOD LIMITED',
+    });
+  });
+
+  it('is case-insensitive in both directions', () => {
+    expect(matchKfintechCompanyByName('MILKY MIST', companies)?.clientId).toBe('2');
+    expect(matchKfintechCompanyByName('milky mist dairy food', companies)?.clientId).toBe('2');
+  });
+
+  it('returns null when nothing clears the threshold', () => {
+    expect(matchKfintechCompanyByName('Shiprocket', companies)).toBeNull();
+  });
+
+  it('never attaches an NCD entry to an equity name', () => {
+    expect(matchKfintechCompanyByName('Power Finance Corporation', companies)).toBeNull();
+  });
+
+  it('prefers the entry carrying fewest unrelated words when scores tie', () => {
+    // Both cover "milky mist" completely, so the score is 1 either way; the
+    // tie-break is which name drags along less that we did not ask for.
+    const both = [
+      { clientId: 'long', name: 'MILKY MIST DAIRY FOOD AND BEVERAGES HOLDINGS LIMITED' },
+      { clientId: 'short', name: 'MILKY MIST DAIRY FOOD LIMITED' },
+    ];
+    expect(matchKfintechCompanyByName('Milky Mist', both)?.clientId).toBe('short');
+  });
+
+  it('ignores entries whose name is entirely noise', () => {
+    expect(matchKfintechCompanyByName('Milky Mist', [{ clientId: '9', name: 'LIMITED' }])).toBeNull();
   });
 });
 
