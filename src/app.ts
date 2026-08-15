@@ -5,7 +5,6 @@ import morgan from 'morgan';
 
 import { env } from './env.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
-import { httpLog } from './middleware/httpLog.js';
 import { accountsRouter } from './routes/accounts.js';
 import { allotmentsRouter } from './routes/allotments.js';
 import { applicationsRouter } from './routes/applications.js';
@@ -31,10 +30,6 @@ export function createApp() {
   app.use(cors({ origin: env.corsOrigins.length > 0 ? env.corsOrigins : false }));
   app.use(express.json({ limit: '2mb' }));
   if (env.NODE_ENV !== 'test') app.use(morgan('tiny'));
-  // After the parser, because it reads req.body — a body too malformed to parse
-  // never reaches this and shows up as morgan's 400 instead. Morgan stays the
-  // always-on access log; this is the opt-in detail log behind DEBUG_HTTP.
-  app.use(httpLog);
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true });
