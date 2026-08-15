@@ -1,6 +1,11 @@
 /**
  * The app's "Check status" button.
  *
+ * `/check` asks whichever registrar handles each application's issue — KFintech
+ * or MUFG Intime; checkAllotments.ts routes it. `/sync-kfintech` is narrower
+ * than its name suggests only in that MUFG needs no equivalent: its company ids
+ * are resolved on demand inside the check itself.
+ *
  * Both endpoints were Edge Function invocations before. The ownership check
  * that `check-allotments` had to do by hand — build a second Supabase client
  * from the caller's JWT, resolve the user, filter the requested ids — is now

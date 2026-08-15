@@ -37,7 +37,10 @@ export function normaliseEmail(email: string): string {
 
 export async function hashPassword(password: string): Promise<string> {
   if (password.length < MIN_PASSWORD_LENGTH) {
-    throw badRequest('weak_password', `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+    throw badRequest(
+      'weak_password',
+      `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`,
+    );
   }
   return bcrypt.hash(password, BCRYPT_ROUNDS);
 }
@@ -54,9 +57,14 @@ export type Session = {
  * Mints a session. The raw refresh token is returned to the caller and only its
  * hash is persisted, so a database dump yields no usable sessions.
  */
-export async function issueSession(user: { id: string; email: string }): Promise<Session> {
+export async function issueSession(user: {
+  id: string;
+  email: string;
+}): Promise<Session> {
   const refreshToken = randomBytes(48).toString('base64url');
-  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+  const expiresAt = new Date(
+    Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000,
+  );
 
   await prisma.refreshToken.create({
     data: { userId: user.id, tokenHash: sha256(refreshToken), expiresAt },
@@ -70,12 +78,22 @@ export async function issueSession(user: { id: string; email: string }): Promise
   };
 }
 
-export async function signUp(email: string, password: string, displayName: string): Promise<Session> {
+export async function signUp(
+  email: string,
+  password: string,
+  displayName: string,
+): Promise<Session> {
   const normalised = normaliseEmail(email);
   const passwordHash = await hashPassword(password);
 
-  const existing = await prisma.user.findUnique({ where: { email: normalised } });
-  if (existing) throw badRequest('email_taken', 'An account with that email already exists.');
+  const existing = await prisma.user.findUnique({
+    where: { email: normalised },
+  });
+  if (existing)
+    throw badRequest(
+      'email_taken',
+      'An account with that email already exists.',
+    );
 
   // The user row and its profile are created together — the Supabase schema did
   // this with an on-insert trigger, and a user without a profile would break
@@ -84,22 +102,35 @@ export async function signUp(email: string, password: string, displayName: strin
     data: {
       email: normalised,
       passwordHash,
-      profile: { create: { displayName: displayName.trim() || normalised.split('@')[0] } },
+      profile: {
+        create: { displayName: displayName.trim() || normalised.split('@')[0] },
+      },
     },
   });
 
   return issueSession(user);
 }
 
-export async function signIn(email: string, password: string): Promise<Session> {
-  const user = await prisma.user.findUnique({ where: { email: normaliseEmail(email) } });
+export async function signIn(
+  email: string,
+  password: string,
+): Promise<Session> {
+  const user = await prisma.user.findUnique({
+    where: { email: normaliseEmail(email) },
+  });
 
   // Hash even when the user does not exist, so response time does not reveal
   // which emails are registered.
-  const hash = user?.passwordHash ?? '$2a$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinva';
+  const hash =
+    user?.passwordHash ??
+    '$2a$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinva';
   const ok = await bcrypt.compare(password, hash);
 
-  if (!user || !ok) throw unauthorized('invalid_credentials', 'That email and password do not match.');
+  if (!user || !ok)
+    throw unauthorized(
+      'invalid_credentials',
+      'That email and password do not match.',
+    );
   return issueSession(user);
 }
 
@@ -116,7 +147,10 @@ export async function refreshSession(refreshToken: string): Promise<Session> {
   });
 
   if (!stored || stored.revokedAt || stored.expiresAt <= new Date()) {
-    throw unauthorized('invalid_refresh_token', 'Session expired. Sign in again.');
+    throw unauthorized(
+      'invalid_refresh_token',
+      'Session expired. Sign in again.',
+    );
   }
 
   await prisma.refreshToken.update({
@@ -149,8 +183,12 @@ export async function revokeAllSessions(userId: string): Promise<void> {
  * respond 200 either way — telling an anonymous caller whether an address is
  * registered is an account-enumeration hole.
  */
-export async function createPasswordReset(email: string): Promise<{ token: string; userId: string } | null> {
-  const user = await prisma.user.findUnique({ where: { email: normaliseEmail(email) } });
+export async function createPasswordReset(
+  email: string,
+): Promise<{ token: string; userId: string } | null> {
+  const user = await prisma.user.findUnique({
+    where: { email: normaliseEmail(email) },
+  });
   if (!user) return null;
 
   const token = randomBytes(32).toString('base64url');
@@ -165,19 +203,33 @@ export async function createPasswordReset(email: string): Promise<{ token: strin
   return { token, userId: user.id };
 }
 
-export async function confirmPasswordReset(token: string, newPassword: string): Promise<void> {
+export async function confirmPasswordReset(
+  token: string,
+  newPassword: string,
+): Promise<void> {
   const tokenHash = sha256(token);
-  const stored = await prisma.passwordResetToken.findUnique({ where: { tokenHash } });
+  const stored = await prisma.passwordResetToken.findUnique({
+    where: { tokenHash },
+  });
 
   if (!stored || stored.usedAt || stored.expiresAt <= new Date()) {
-    throw badRequest('invalid_reset_token', 'That reset link has expired. Request a new one.');
+    throw badRequest(
+      'invalid_reset_token',
+      'That reset link has expired. Request a new one.',
+    );
   }
 
   const passwordHash = await hashPassword(newPassword);
 
   await prisma.$transaction([
-    prisma.passwordResetToken.update({ where: { tokenHash }, data: { usedAt: new Date() } }),
-    prisma.user.update({ where: { id: stored.userId }, data: { passwordHash } }),
+    prisma.passwordResetToken.update({
+      where: { tokenHash },
+      data: { usedAt: new Date() },
+    }),
+    prisma.user.update({
+      where: { id: stored.userId },
+      data: { passwordHash },
+    }),
     // A password reset is how someone recovers from a compromise, so it has to
     // end every session, not just the one doing the resetting.
     prisma.refreshToken.updateMany({

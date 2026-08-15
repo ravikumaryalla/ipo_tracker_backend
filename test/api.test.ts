@@ -77,8 +77,11 @@ describeDb('API', () => {
       .post('/ipos')
       .set(auth(token))
       .send({
-        symbol: `T${Date.now() % 100000}`,
-        company_name: 'Test Co',
+        // An IPO is unique table-wide now, by symbol and by company + open date,
+        // so both have to differ per fixture user — a clash would hand back the
+        // other user's row instead of a 201.
+        symbol: `T${email.replace(/[^a-z0-9]/gi, '').toUpperCase()}`,
+        company_name: `Test Co ${email.split('@')[0]}`,
         segment: 'MAINBOARD',
         open_date: '2026-08-01',
         close_date: '2026-08-03',
@@ -323,6 +326,131 @@ describeDb('API', () => {
 
       const bobProfile = await request(app).get('/profile').set(auth(bob.token)).expect(200);
       expect(bobProfile.body.vault_salt).toBeNull();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+
+  describe('ipos (one symbol, one row)', () => {
+    let alice: Fixture;
+
+    const manual = (patch: Record<string, unknown> = {}) => ({
+      symbol: 'DUPCO',
+      company_name: 'Dup Co',
+      segment: 'MAINBOARD',
+      open_date: '2026-08-01',
+      close_date: '2026-08-03',
+      allotment_date: null,
+      listing_date: null,
+      price_band_min: 100,
+      price_band_max: 105,
+      lot_size: 15,
+      registrar: null,
+      ...patch,
+    });
+
+    beforeEach(async () => {
+      alice = await seedUser('alice@example.com');
+    });
+
+    it('folds a duplicate symbol into the existing row instead of adding one', async () => {
+      const first = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual())
+        .expect(201);
+
+      // Same symbol, different everything else: no error, no second row.
+      const second = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ company_name: 'Dup Co Again', open_date: '2026-09-01' }))
+        .expect(200);
+
+      expect(second.body.id).toBe(first.body.id);
+      expect(second.body.company_name).toBe('Dup Co');
+      expect(await prisma.ipo.count({ where: { symbol: 'DUPCO' } })).toBe(1);
+    });
+
+    // The duplicate the table actually collected: one company and one open date
+    // under a different synthesised symbol each time.
+    it('folds one company opening on one day, whatever symbol it arrives under', async () => {
+      const first = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'BEHARILALENGINEERING', company_name: 'Behari Lal Engineering' }))
+        .expect(201);
+
+      const second = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'BLEL', company_name: 'Behari Lal Engineering Ltd.' }))
+        .expect(200);
+
+      expect(second.body.id).toBe(first.body.id);
+      expect(await prisma.ipo.count({ where: { companyName: { startsWith: 'Behari' } } })).toBe(1);
+    });
+
+    it('keeps one company as two rows when the open dates differ', async () => {
+      await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'ACMEAUG', company_name: 'Acme Co', open_date: '2026-08-01' }))
+        .expect(201);
+      await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'ACMESEP', company_name: 'Acme Co', open_date: '2026-09-01' }))
+        .expect(201);
+
+      expect(await prisma.ipo.count({ where: { companyName: 'Acme Co' } })).toBe(2);
+    });
+
+    it('folds a duplicate even when the open date is null on both', async () => {
+      const first = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'NODATE', open_date: null, close_date: null }))
+        .expect(201);
+
+      const second = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'NODATE', open_date: null, close_date: null }))
+        .expect(200);
+
+      expect(second.body.id).toBe(first.body.id);
+      expect(await prisma.ipo.count({ where: { symbol: 'NODATE' } })).toBe(1);
+    });
+
+    it('refuses to rename an IPO onto a symbol another row already holds', async () => {
+      await request(app).post('/ipos').set(auth(alice.token)).send(manual()).expect(201);
+      const other = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual({ symbol: 'OTHERCO', company_name: 'Other Co' }))
+        .expect(201);
+
+      const res = await request(app)
+        .patch(`/ipos/${other.body.id}`)
+        .set(auth(alice.token))
+        .send({ symbol: 'DUPCO' })
+        .expect(409);
+      expect(res.body.error.code).toBe('23505');
+    });
+
+    it('still allows a PATCH that resends the row own symbol', async () => {
+      const row = await request(app)
+        .post('/ipos')
+        .set(auth(alice.token))
+        .send(manual())
+        .expect(201);
+
+      await request(app)
+        .patch(`/ipos/${row.body.id}`)
+        .set(auth(alice.token))
+        .send({ symbol: 'DUPCO', company_name: 'Renamed Co' })
+        .expect(200);
     });
   });
 

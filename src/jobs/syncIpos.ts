@@ -29,13 +29,18 @@
  * `resolveKfintechCompanyMatch` now falls through to a scored name match — see
  * the fuzzy-matching section of syncIpos.parse.ts for what keeps that narrow.
  *
- * KNOWN GAP, carried over unchanged: `ipos_symbol_open_idx` is a global unique
- * index on (symbol, open_date), not scoped by created_by. If a user manually
- * adds an IPO that a provider later syncs under the same symbol and open date,
- * the upsert overwrites their row and reassigns it to the shared pool. Fixing
- * that needs partial unique indexes, and Postgres can only use a partial index
- * as an ON CONFLICT arbiter when the inference includes a matching WHERE. Left
- * open deliberately.
+ * IDENTITY, changed 2026-08-15: an IPO is now (normalized company name, open
+ * date) — `ipos_company_idx` — with a second unique index on symbol alone. The
+ * old key was (symbol, open_date), which caught neither duplicate the table
+ * actually collected. Symbols are synthesised from company names by the
+ * scrapers, and that synthesis changed across releases, so one issue accumulated
+ * a row per generation: BEHARILALENGINEERING, BEHARILAL and BLEL were all Behari
+ * Lal Engineering opening on the same day. Nothing keyed on symbol could see it.
+ *
+ * KNOWN GAP, widened deliberately: neither index is scoped by created_by. If a
+ * user manually adds an IPO a provider later syncs, the upsert overwrites the
+ * fields they typed. Their `created_by` survives (it is not in the DO UPDATE
+ * list), so the row stays theirs.
  *
  * The Edge runtime's per-run byte budget (WORKER_RESOURCE_LIMIT) that shaped
  * several decisions below no longer applies on Node. The shapes are kept anyway
@@ -46,6 +51,7 @@
 import { Prisma } from '@prisma/client';
 
 import { prisma } from '../db.js';
+import { jobLog, type JobLog } from '../util/jobLog.js';
 import {
   ipogyaniGmpRow,
   type IpogyaniIpo,
@@ -57,7 +63,10 @@ import {
 } from './ipogyani.js';
 import { getKfintechCompanies, saveKfintechMatch } from './kfintechCompanies.js';
 import {
+  alignToExistingNames,
   buildIpoIndexes,
+  dedupeRecords,
+  type ExistingIpo,
   type GmpReading,
   type IpoIndexes,
   type IpoRecord,
@@ -423,36 +432,63 @@ const fetchIpogyani: Provider = async (prior) => {
 // persistence
 // ---------------------------------------------------------------------------
 
+/** Postgres 23505 — unique_violation. */
+const UNIQUE_VIOLATION = '23505';
+
 /**
- * Raw SQL rather than a loop of Prisma upserts: this is one multi-row statement
- * with a real ON CONFLICT target, which is what the PostgREST version compiled
- * to and what keeps the whole provider's write atomic.
+ * The names already on file for the open dates this batch touches — the pool
+ * `alignToExistingNames` scores against.
  *
- * Every column the providers supply is overwritten on conflict. Columns they do
- * not know about — registrar, kfintech_company_id, created_by — are deliberately
- * absent from the DO UPDATE list so later passes cannot be undone by an earlier
- * provider's next run.
+ * Scoped to those exact dates rather than the ±45 day window the GMP matcher
+ * uses: a merge here rewrites an issue's identity, so it only ever runs against
+ * rows that share the batch's open date.
  */
-async function upsertIpos(records: IpoRecord[]): Promise<number> {
-  // Rows without an open date can't participate in the (symbol, open_date)
-  // unique index, so skip them rather than creating duplicates on every run.
-  const usable = records.filter((r) => r.open_date);
-  if (usable.length === 0) return 0;
-
-  const now = new Date();
-  const values = usable.map(
-    (r) => Prisma.sql`(
-      ${r.symbol}, ${r.company_name}, ${r.exchange},
-      ${r.segment}::public.ipo_segment, ${r.status}::public.ipo_status,
-      ${r.open_date}::date, ${r.close_date}::date, ${r.allotment_date}::date,
-      ${r.listing_date}::date,
-      ${r.price_band_min}::numeric, ${r.price_band_max}::numeric,
-      ${r.lot_size}::integer, ${r.issue_size_cr}::numeric,
-      ${r.source}, ${now}
-    )`,
+async function loadExistingNames(records: IpoRecord[]): Promise<ExistingIpo[]> {
+  const dates = [...new Set(records.map((r) => r.open_date))].filter(
+    (d): d is string => d !== null,
   );
+  if (dates.length === 0) return [];
 
-  await prisma.$executeRaw`
+  const rows = await prisma.ipo.findMany({
+    where: { openDate: { in: dates.map((d) => new Date(d)) } },
+    select: { companyName: true, openDate: true },
+  });
+
+  return rows.map((row) => ({
+    company_name: row.companyName,
+    open_date: row.openDate ? row.openDate.toISOString().slice(0, 10) : null,
+  }));
+}
+
+function ipoValues(r: IpoRecord, now: Date): Prisma.Sql {
+  return Prisma.sql`(
+    ${r.symbol}, ${r.company_name}, ${r.exchange},
+    ${r.segment}::public.ipo_segment, ${r.status}::public.ipo_status,
+    ${r.open_date}::date, ${r.close_date}::date, ${r.allotment_date}::date,
+    ${r.listing_date}::date,
+    ${r.price_band_min}::numeric, ${r.price_band_max}::numeric,
+    ${r.lot_size}::integer, ${r.issue_size_cr}::numeric,
+    ${r.source}, ${now}
+  )`;
+}
+
+/**
+ * The insert, for one or many records.
+ *
+ * The conflict target is the company, not the symbol: `ipos_company_idx` is a
+ * unique index over (ipo_name_key(company_name), open_date), and that is what
+ * identifies an issue. Symbols are synthesised from the company name by each
+ * scraper and have changed shape across releases, so arbitrating on them would
+ * write a second row for an issue that is already there under an older
+ * synthesis — which is exactly how the duplicates got in.
+ *
+ * Every column the providers supply is overwritten on conflict, symbol included.
+ * Columns they do not know about — registrar, kfintech_company_id, created_by —
+ * are deliberately absent from the DO UPDATE list so later passes cannot be
+ * undone by an earlier provider's next run.
+ */
+function ipoInsert(values: Prisma.Sql[]): Prisma.Sql {
+  return Prisma.sql`
     insert into public.ipos (
       symbol, company_name, exchange, segment, status,
       open_date, close_date, allotment_date, listing_date,
@@ -460,8 +496,8 @@ async function upsertIpos(records: IpoRecord[]): Promise<number> {
       source, last_synced_at
     )
     values ${Prisma.join(values)}
-    on conflict (symbol, open_date) do update set
-      company_name   = excluded.company_name,
+    on conflict (public.ipo_name_key(company_name), open_date) do update set
+      symbol         = excluded.symbol,
       exchange       = excluded.exchange,
       segment        = excluded.segment,
       status         = excluded.status,
@@ -475,8 +511,64 @@ async function upsertIpos(records: IpoRecord[]): Promise<number> {
       source         = excluded.source,
       last_synced_at = excluded.last_synced_at
   `;
+}
 
-  return usable.length;
+/**
+ * Raw SQL rather than a loop of Prisma upserts: one multi-row statement with a
+ * real ON CONFLICT target, which is what the PostgREST version compiled to and
+ * what keeps the whole provider's write atomic.
+ *
+ * The fallback exists because the table has a second unique key the statement
+ * cannot arbitrate on at the same time. If an incoming issue wants a symbol some
+ * *other* company already holds — two feeds truncating different names to the
+ * same 12 or 20 characters — the batch fails on ipos_symbol_idx and would
+ * otherwise lose the provider's entire write. So it is retried row by row and
+ * the offending record is dropped silently, which is what a duplicate symbol
+ * deserves: one symbol, one row.
+ */
+async function upsertIpos(records: IpoRecord[], log: JobLog): Promise<number> {
+  // A record with no open date is too thin to be worth a row — it cannot be
+  // matched to a GMP reading or shown on a calendar, and every provider
+  // eventually republishes it with a date.
+  const dated = records.filter((r) => r.open_date);
+  if (dated.length === 0) return 0;
+
+  // The index catches spellings that normalize alike; this catches the ones
+  // that do not — a feed shortening "Lalithaa Jewellery Mart" to "Lalithaa
+  // Jewellery" would otherwise open a second row for the same issue.
+  const usable = dedupeRecords(alignToExistingNames(dated, await loadExistingNames(dated)));
+  if (usable.length === 0) return 0;
+
+  const now = new Date();
+
+  try {
+    await prisma.$executeRaw(ipoInsert(usable.map((r) => ipoValues(r, now))));
+    return usable.length;
+  } catch (err) {
+    if (!isUniqueViolation(err)) throw err;
+  }
+
+  let written = 0;
+  let dropped = 0;
+  for (const record of usable) {
+    try {
+      await prisma.$executeRaw(ipoInsert([ipoValues(record, now)]));
+      written += 1;
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+      dropped += 1;
+    }
+  }
+  log.note(`symbol clash: wrote ${written}, dropped ${dropped}`);
+  return written;
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    // P2010 is the raw-query wrapper; the driver code sits in its meta.
+    return err.code === 'P2002' || (err.meta as { code?: string } | undefined)?.code === UNIQUE_VIOLATION;
+  }
+  return false;
 }
 
 function windowAround(days: number): { from: string; to: string } {
@@ -696,7 +788,13 @@ export async function syncKfintechCompanies(): Promise<number> {
 
 export type Outcome = { provider: string; ok: boolean; rows: number; message?: string };
 
-async function logOutcome(outcome: Outcome): Promise<void> {
+/**
+ * Every provider and every follow-up pass funnels through here, so this is the
+ * one place both records need — sync_log for the app's staleness banner, stdout
+ * for whoever is watching the run.
+ */
+async function logOutcome(outcome: Outcome, log: JobLog, ms?: number): Promise<void> {
+  log.step(outcome.provider, outcome.ok, outcome.rows, ms, outcome.message);
   await prisma.syncLog.create({
     data: {
       provider: outcome.provider,
@@ -737,18 +835,30 @@ async function fetchGmp(): Promise<GmpReading[]> {
  * multi-provider scrape.
  */
 export async function syncKfintechOnly(): Promise<{ ok: boolean; outcomes: Outcome[] }> {
+  const log = jobLog('sync-kfintech');
+  log.start();
+
   const outcome: Outcome = { provider: 'KFINTECH_MATCH', ok: false, rows: 0 };
+  const startedAt = Date.now();
   try {
     outcome.rows = await syncKfintechCompanies();
     outcome.ok = true;
   } catch (e) {
     outcome.message = e instanceof Error ? e.message : String(e);
   }
-  await logOutcome(outcome);
+  await logOutcome(outcome, log, Date.now() - startedAt);
+
+  log.done(
+    outcome.ok ? `${outcome.rows} matched` : `failed: ${outcome.message ?? 'unknown error'}`,
+    outcome.ok,
+  );
   return { ok: outcome.ok, outcomes: [outcome] };
 }
 
 export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> {
+  const log = jobLog('sync-ipos');
+  log.start();
+
   // One run must never serve its cached page to the next.
   ipowatchGmpHtml = null;
 
@@ -777,18 +887,19 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
   const registrars: RegistrarAssignment[] = [];
 
   for (const [name, provider] of providers) {
+    const startedAt = Date.now();
     try {
       const result = await provider(prior);
-      const rows = await upsertIpos(result.records);
+      const rows = await upsertIpos(result.records, log);
       prior.push(...result.records);
       if (result.slugIndex) for (const [k, v] of result.slugIndex) slugIndex.set(k, v);
       if (result.registrars) registrars.push(...result.registrars);
       outcomes.push({ provider: name, ok: true, rows });
-      await logOutcome({ provider: name, ok: true, rows });
+      await logOutcome({ provider: name, ok: true, rows }, log, Date.now() - startedAt);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       outcomes.push({ provider: name, ok: false, rows: 0, message });
-      await logOutcome({ provider: name, ok: false, rows: 0, message });
+      await logOutcome({ provider: name, ok: false, rows: 0, message }, log, Date.now() - startedAt);
     }
   }
 
@@ -802,6 +913,7 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
   const indexes = await loadIpoIndexes();
 
   const registrar: Outcome = { provider: 'REGISTRAR', ok: false, rows: 0 };
+  const registrarStartedAt = Date.now();
   try {
     registrar.rows = await applyRegistrars(registrars, indexes);
     registrar.ok = true;
@@ -809,7 +921,7 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
     registrar.message = e instanceof Error ? e.message : String(e);
   }
   outcomes.push(registrar);
-  await logOutcome(registrar);
+  await logOutcome(registrar, log, Date.now() - registrarStartedAt);
 
   // Each feed is fetched, written and logged on its own so one dying leaves the
   // other's series intact. The backfill pass is shared — it re-tries every
@@ -821,6 +933,7 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
 
   for (const [name, fetchReadings] of gmpFeeds) {
     const gmp: Outcome = { provider: name, ok: false, rows: 0 };
+    const gmpStartedAt = Date.now();
     try {
       gmp.rows = await writeGmp(await fetchReadings(), slugIndex, indexes);
       gmp.ok = true;
@@ -828,10 +941,11 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
       gmp.message = e instanceof Error ? e.message : String(e);
     }
     outcomes.push(gmp);
-    await logOutcome(gmp);
+    await logOutcome(gmp, log, Date.now() - gmpStartedAt);
   }
 
   const backfill: Outcome = { provider: 'GMP_BACKFILL', ok: false, rows: 0 };
+  const backfillStartedAt = Date.now();
   try {
     backfill.rows = await backfillGmp(slugIndex, indexes);
     backfill.ok = true;
@@ -839,9 +953,10 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
     backfill.message = e instanceof Error ? e.message : String(e);
   }
   outcomes.push(backfill);
-  await logOutcome(backfill);
+  await logOutcome(backfill, log, Date.now() - backfillStartedAt);
 
   const kfintech: Outcome = { provider: 'KFINTECH_MATCH', ok: false, rows: 0 };
+  const kfintechStartedAt = Date.now();
   if (await hasSucceededBefore('KFINTECH_MATCH')) {
     kfintech.ok = true;
     kfintech.message = 'skipped: already synced once';
@@ -854,7 +969,7 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
     }
   }
   outcomes.push(kfintech);
-  await logOutcome(kfintech);
+  await logOutcome(kfintech, log, Date.now() - kfintechStartedAt);
 
   // Roll IPOs forward through their lifecycle regardless of whether the fetch
   // worked, so the app's Open/Closed tabs stay correct even when a provider is
@@ -864,7 +979,7 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
   // sync silently rewrites the status of IPOs a user entered by hand, which
   // breaks the promise made at the top of this file.
   const today = new Date(new Date().toISOString().slice(0, 10));
-  await prisma.ipo.updateMany({
+  const opened = await prisma.ipo.updateMany({
     where: {
       createdBy: null,
       openDate: { lte: today },
@@ -873,10 +988,20 @@ export async function syncIpos(): Promise<{ ok: boolean; outcomes: Outcome[] }> 
     },
     data: { status: 'OPEN' },
   });
-  await prisma.ipo.updateMany({
+  const closed = await prisma.ipo.updateMany({
     where: { createdBy: null, closeDate: { lt: today }, status: { in: ['UPCOMING', 'OPEN'] } },
     data: { status: 'CLOSED' },
   });
+  // The one write in this job with no sync_log row of its own, and the one that
+  // moves what the app's Open/Closed tabs show.
+  log.note(`status roll: ${opened.count} -> OPEN, ${closed.count} -> CLOSED`);
+
+  const failed = outcomes.filter((o) => !o.ok).length;
+  const rows = outcomes.reduce((sum, o) => sum + o.rows, 0);
+  log.done(
+    `${outcomes.length - failed} ok, ${failed} failed, ${rows} rows`,
+    anyOk && failed === 0,
+  );
 
   return { ok: anyOk, outcomes };
 }

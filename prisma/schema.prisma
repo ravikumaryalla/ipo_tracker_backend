@@ -186,8 +186,21 @@ model DematAccount {
 /// Public market data. `createdBy` null means a synced/shared row; a non-null
 /// value means one user typed it in manually and only they can see it.
 model Ipo {
-  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  symbol       String
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Unique table-wide — not scoped by `createdBy` — so one symbol is one row
+  /// for everybody, and a second IPO arriving under a symbol that already exists
+  /// is silently folded into it rather than added.
+  ///
+  /// It is NOT the sync upsert key. The scrapers synthesise symbols from company
+  /// names and that synthesis has changed over time, so one company has arrived
+  /// under several symbols; identity is (normalized company name, open date),
+  /// enforced by `ipos_company_idx`. That index is an expression index over
+  /// `public.ipo_name_key(company_name)`, which Prisma cannot model — it lives in
+  /// the 20260815000000_ipos_symbol_unique migration only. Do not let
+  /// `prisma migrate dev` drop it.
+  symbol String @unique(map: "ipos_symbol_idx")
+
   companyName  String     @map("company_name")
   exchange     String     @default("NSE")
   segment      IpoSegment @default(MAINBOARD)
@@ -212,6 +225,12 @@ model Ipo {
   /// once per issue by the sync job. Null when unmatched.
   kfintechCompanyId String? @map("kfintech_company_id")
 
+  /// The same thing for MUFG Intime (ex-Link Intime) — their dropdown's
+  /// `company_id`, resolved on demand by the allotment check. Only one of the
+  /// two is ever set: an issue has one registrar. Null when unmatched, which is
+  /// also the state for every issue MUFG does not register.
+  mufgCompanyId String? @map("mufg_company_id")
+
   source       String    @default("MANUAL")
   createdBy    String?   @map("created_by") @db.Uuid
   lastSyncedAt DateTime? @map("last_synced_at") @db.Timestamptz(6)
@@ -222,8 +241,6 @@ model Ipo {
   applications IpoApplication[]
   gmp          IpoGmp[]
 
-  /// The sync upsert key: two IPOs never share a symbol and an open date.
-  @@unique([symbol, openDate], map: "ipos_symbol_open_idx")
   @@index([openDate(sort: Desc)], map: "ipos_dates_idx")
   @@map("ipos")
 }

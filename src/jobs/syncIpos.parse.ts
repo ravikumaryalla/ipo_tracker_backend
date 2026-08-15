@@ -36,6 +36,85 @@ export type IpoRecord = {
   source: string;
 };
 
+/**
+ * Collapse a provider's records to one row per IPO, silently — a duplicate is
+ * not a row to write but a row to drop.
+ *
+ * Two passes, because `ipos` now carries two unique keys and a batch has to
+ * respect both. The company key runs first: it is the real identity, since the
+ * symbol is synthesised from the company name and the synthesis has changed
+ * across releases (one issue has sat in the table as BEHARILALENGINEERING,
+ * BEHARILAL and BLEL at once).
+ *
+ * This is required rather than tidy: a single multi-row INSERT ... ON CONFLICT
+ * DO UPDATE that names the same key twice fails outright with Postgres 21000
+ * ("cannot affect row a second time"), taking that provider's whole write with
+ * it. NSE and BSE push into flat arrays with no key map of their own, and BSE
+ * synthesises a symbol from the first 12 characters of the company name, so a
+ * repeat is entirely plausible.
+ *
+ * Last wins, matching the per-provider Maps in syncIpos.ts and the provider
+ * ordering there — later data is the more recent reading of the same issue.
+ */
+export function dedupeRecords(records: IpoRecord[]): IpoRecord[] {
+  const byCompany = new Map<string, IpoRecord>();
+  for (const record of records) {
+    byCompany.set(`${normalizeName(record.company_name)}|${record.open_date ?? ''}`, record);
+  }
+
+  const bySymbol = new Map<string, IpoRecord>();
+  for (const record of byCompany.values()) bySymbol.set(record.symbol, record);
+  return [...bySymbol.values()];
+}
+
+/** An `ipos` row as the alignment pass needs it. */
+export type ExistingIpo = { company_name: string; open_date: string | null };
+
+/**
+ * Rewrite an incoming record's company name to the one an existing row already
+ * carries, when the two are the same issue under a different spelling.
+ *
+ * `ipos_company_idx` keys on the *normalized* name, which folds punctuation,
+ * legal suffixes and the word "IPO" — but not a feed publishing a shorter name
+ * than it did last week. "Lalithaa Jewellery" and "Lalithaa Jewellery Mart"
+ * open on the same day and are one company, yet normalize to two different keys
+ * and so land as two rows. No unique index can see that; this can, using the
+ * same directional score the registrar matcher uses.
+ *
+ * Deliberately narrow, because a false merge silently destroys a real IPO:
+ *
+ *   - the open dates must be identical, not merely close
+ *   - exactly one candidate may match; a tie means we do not know, so leave it
+ *   - the score must clear NAME_MATCH_THRESHOLD in one direction or the other,
+ *     since either side may be the longer name
+ *
+ * Renaming the record is enough to merge it: the name is the conflict key, so
+ * the upsert then folds onto the existing row instead of inserting beside it.
+ */
+export function alignToExistingNames(records: IpoRecord[], existing: ExistingIpo[]): IpoRecord[] {
+  if (existing.length === 0) return records;
+
+  const known = new Set(existing.map((row) => `${normalizeName(row.company_name)}|${row.open_date}`));
+
+  return records.map((record) => {
+    const name = normalizeName(record.company_name);
+    if (!name || known.has(`${name}|${record.open_date}`)) return record;
+
+    const matches = existing.filter(
+      (row) =>
+        row.open_date === record.open_date &&
+        normalizeName(row.company_name) !== name &&
+        Math.max(
+          nameMatchScore(record.company_name, row.company_name),
+          nameMatchScore(row.company_name, record.company_name),
+        ) >= NAME_MATCH_THRESHOLD,
+    );
+    if (matches.length !== 1) return record;
+
+    return { ...record, company_name: matches[0].company_name };
+  });
+}
+
 /** One grey-market reading, shaped for public.ipo_gmp. */
 export type GmpReading = {
   provider: string;
@@ -944,23 +1023,27 @@ export function resolveKfintechCompanyMatch(
 }
 
 /**
- * The same match run the other way round: one of our IPO names against the
- * whole KFintech dropdown.
+ * The same match run the other way round: one of our IPO names against a whole
+ * registrar dropdown.
  *
  * `resolveKfintechCompanyMatch` is the bulk direction — walk their list, find
  * our row. This is the on-demand direction, for the "Check status" button,
  * which has exactly one IPO in hand and needs the `clientId` its allotment API
  * wants. Same ladder, same guards, same take-the-best tie-breaking.
+ *
+ * Generic over the entry type because MUFG Intime's dropdown has the same two
+ * fields under the same names and nothing here is KFintech-specific — only the
+ * scraping that produces the list is.
  */
-export function matchKfintechCompanyByName(
+export function matchCompanyByName<T extends { clientId: string; name: string }>(
   ipoName: string,
-  companies: KfintechCompany[],
-): KfintechCompany | null {
+  companies: T[],
+): T | null {
   const ours = nameTokens(ipoName);
   if (ours.length === 0) return null;
   const dense = ours.join('');
 
-  let best: { company: KfintechCompany; score: number; extra: number } | null = null;
+  let best: { company: T; score: number; extra: number } | null = null;
   let tied = false;
   for (const company of companies) {
     const theirs = nameTokens(company.name);
@@ -982,3 +1065,6 @@ export function matchKfintechCompanyByName(
 
   return best && !tied ? best.company : null;
 }
+
+/** @deprecated Use {@link matchCompanyByName} — kept so older imports resolve. */
+export const matchKfintechCompanyByName = matchCompanyByName<KfintechCompany>;

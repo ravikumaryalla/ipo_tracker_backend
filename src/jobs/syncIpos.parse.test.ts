@@ -13,9 +13,12 @@
  * imagined.
  */
 import {
+  alignToExistingNames,
   buildIpoIndexes,
   decodeEntities,
+  dedupeRecords,
   type GmpReading,
+  type IpoRecord,
   ipowatchGmpRow,
   ipowatchIpoRow,
   type IpowatchGmpRow,
@@ -170,6 +173,128 @@ describe('resolveIpoId', () => {
 
   it('returns null when the open date is too far from any candidate', () => {
     expect(resolveIpoId(reading({ open_date: '2026-09-30' }), new Map(), indexes)).toBeNull();
+  });
+});
+
+// --- dedupe ----------------------------------------------------------------
+
+describe('dedupeRecords', () => {
+  const record = (patch: Partial<IpoRecord>): IpoRecord => ({
+    symbol: 'BEHARILAL',
+    company_name: 'Behari Lal Engineering Ltd.',
+    exchange: 'NSE',
+    segment: 'SME',
+    status: 'UPCOMING',
+    open_date: '2026-08-12',
+    close_date: '2026-08-14',
+    listing_date: null,
+    price_band_min: null,
+    price_band_max: null,
+    lot_size: null,
+    issue_size_cr: null,
+    allotment_date: null,
+    source: 'NSE',
+    ...patch,
+  });
+
+  it('keeps the last record when a symbol repeats', () => {
+    const out = dedupeRecords([
+      record({ company_name: 'Stale Co' }),
+      record({ company_name: 'Fresh Co' }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].company_name).toBe('Fresh Co');
+  });
+
+  // The duplicate that actually filled the table: one company, one open date,
+  // a different synthesised symbol per scraper generation.
+  it('collapses one company carrying several synthesised symbols', () => {
+    const out = dedupeRecords([
+      record({ symbol: 'BEHARILALENGINEERING' }),
+      record({ symbol: 'BEHARILAL', company_name: 'Behari Lal Engineering Ltd.' }),
+      record({ symbol: 'BLEL', company_name: 'Behari Lal Engineering IPO' }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].symbol).toBe('BLEL');
+  });
+
+  it('keeps the same company as two rows when the open dates differ', () => {
+    const out = dedupeRecords([record({}), record({ symbol: 'BLEL', open_date: '2026-09-01' })]);
+    expect(out).toHaveLength(2);
+  });
+
+  it('leaves distinct companies alone and in order', () => {
+    const out = dedupeRecords([
+      record({}),
+      record({ symbol: 'SHIPROCKET', company_name: 'Shiprocket Ltd.' }),
+    ]);
+    expect(out.map((r) => r.symbol)).toEqual(['BEHARILAL', 'SHIPROCKET']);
+  });
+
+  it('handles an empty batch', () => {
+    expect(dedupeRecords([])).toEqual([]);
+  });
+});
+
+describe('alignToExistingNames', () => {
+  const record = (patch: Partial<IpoRecord>): IpoRecord => ({
+    symbol: 'LALITHAA',
+    company_name: 'Lalithaa Jewellery',
+    exchange: 'NSE',
+    segment: 'MAINBOARD',
+    status: 'UPCOMING',
+    open_date: '2026-08-17',
+    close_date: '2026-08-19',
+    listing_date: null,
+    price_band_min: null,
+    price_band_max: null,
+    lot_size: null,
+    issue_size_cr: null,
+    allotment_date: null,
+    source: 'IPOWATCH',
+    ...patch,
+  });
+
+  const existing = [{ company_name: 'Lalithaa Jewellery Mart', open_date: '2026-08-17' }];
+
+  it('adopts the name already on file when a feed publishes a shorter one', () => {
+    const [out] = alignToExistingNames([record({})], existing);
+    expect(out.company_name).toBe('Lalithaa Jewellery Mart');
+    // Everything else is the incoming record's, untouched.
+    expect(out.symbol).toBe('LALITHAA');
+  });
+
+  it('leaves a record whose normalized name already matches a row', () => {
+    const [out] = alignToExistingNames(
+      [record({ company_name: 'Lalithaa Jewellery Mart Ltd.' })],
+      existing,
+    );
+    expect(out.company_name).toBe('Lalithaa Jewellery Mart Ltd.');
+  });
+
+  it('refuses when the open dates differ', () => {
+    const [out] = alignToExistingNames([record({ open_date: '2026-09-01' })], existing);
+    expect(out.company_name).toBe('Lalithaa Jewellery');
+  });
+
+  it('refuses an unrelated company', () => {
+    const [out] = alignToExistingNames(
+      [record({ company_name: 'Shankesh Jewellers' })],
+      existing,
+    );
+    expect(out.company_name).toBe('Shankesh Jewellers');
+  });
+
+  it('refuses when two existing rows match equally well', () => {
+    const [out] = alignToExistingNames([record({})], [
+      ...existing,
+      { company_name: 'Lalithaa Jewellery Retail', open_date: '2026-08-17' },
+    ]);
+    expect(out.company_name).toBe('Lalithaa Jewellery');
+  });
+
+  it('is a no-op against an empty table', () => {
+    expect(alignToExistingNames([record({})], [])[0].company_name).toBe('Lalithaa Jewellery');
   });
 });
 

@@ -45,14 +45,24 @@ export function isAllotmentCheckDue(allotmentDate: string, nowIso: string): bool
   return now.getTime() >= opensMs && now.getTime() < opensMs + CHECK_WINDOW_MS;
 }
 
-/** One application KFintech has on file against the queried PAN. */
-export type KfintechAllotmentMatch = {
+/**
+ * One application a registrar has on file against the queried PAN.
+ *
+ * Registrar-neutral on purpose: MUFG Intime returns the same five facts under
+ * different names (`PEMNDG`, `NAME1`, `SHARES`, `ALLOT`), and `pickMatch` and
+ * `statusFor` below decide identically whoever produced the row. Only the
+ * fetching and the field names differ per registrar — see mufg.parse.ts.
+ */
+export type AllotmentMatch = {
   applicationNo: string | null;
   dpClientId: string | null;
   applicantName: string | null;
   sharesApplied: number | null;
   sharesAllotted: number;
 };
+
+/** @deprecated Use {@link AllotmentMatch} — kept so older imports keep resolving. */
+export type KfintechAllotmentMatch = AllotmentMatch;
 
 type QueryRow = {
   Appln_No?: unknown;
@@ -67,7 +77,7 @@ function toNumberOrNull(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function toMatch(raw: QueryRow): KfintechAllotmentMatch {
+function toMatch(raw: QueryRow): AllotmentMatch {
   return {
     applicationNo: raw.Appln_No != null ? String(raw.Appln_No) : null,
     dpClientId: raw.DP_CLID != null ? String(raw.DP_CLID) : null,
@@ -81,7 +91,7 @@ function toMatch(raw: QueryRow): KfintechAllotmentMatch {
  * KFintech's query-endpoint JSON body → matches, or null when there's
  * nothing on file yet for this PAN/issue (not an error — just not out yet).
  */
-export function parseKfintechAllotmentBody(body: unknown): KfintechAllotmentMatch[] | null {
+export function parseKfintechAllotmentBody(body: unknown): AllotmentMatch[] | null {
   const rows: unknown[] = Array.isArray((body as { data?: unknown })?.data)
     ? (body as { data: unknown[] }).data
     : [];
@@ -91,28 +101,31 @@ export function parseKfintechAllotmentBody(body: unknown): KfintechAllotmentMatc
 
 /**
  * Two applications on the same PAN (e.g. retail + shareholder category) come
- * back as two rows from KFintech. Application No. is the only thing that
+ * back as two rows from the registrar. Application No. is the only thing that
  * tells them apart — with one candidate there's nothing to disambiguate, and
  * with several we refuse rather than silently attach the wrong one's shares.
+ *
+ * `registrar` only names who to blame in the error, which is user-facing text.
  */
 export function pickMatch(
-  matches: KfintechAllotmentMatch[],
+  matches: AllotmentMatch[],
   applicationNo: string | null,
-): KfintechAllotmentMatch {
+  registrar = 'KFintech',
+): AllotmentMatch {
   if (matches.length === 1) return matches[0];
   if (applicationNo) {
     const exact = matches.find((m) => m.applicationNo === applicationNo);
     if (exact) return exact;
   }
   throw new Error(
-    'KFintech has more than one application on file for this PAN and issue, and this application ' +
-      'has no application number saved to tell them apart.',
+    `${registrar} has more than one application on file for this PAN and issue, and this ` +
+      'application has no application number saved to tell them apart.',
   );
 }
 
 export type AllotmentOutcome = 'ALLOTTED' | 'PARTIAL' | 'NOT_ALLOTTED';
 
-export function statusFor(match: KfintechAllotmentMatch, fallbackApplied: number): AllotmentOutcome {
+export function statusFor(match: AllotmentMatch, fallbackApplied: number): AllotmentOutcome {
   if (match.sharesAllotted <= 0) return 'NOT_ALLOTTED';
   const applied = match.sharesApplied ?? fallbackApplied;
   return match.sharesAllotted < applied ? 'PARTIAL' : 'ALLOTTED';

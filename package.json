@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "prisma generate && tsc -p tsconfig.json",
-    "// start": "dist/src/, not dist/, because the build also compiles scripts/",
+    "// start": "dist/src/, not dist/, because the build also compileon s scripts/",
     "start": "node dist/src/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest",

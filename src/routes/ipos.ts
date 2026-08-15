@@ -12,7 +12,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../db.js';
-import { forbidden, notFound } from '../errors.js';
+import { conflict, forbidden, notFound } from '../errors.js';
 import { requireAuth, userId } from '../middleware/auth.js';
 import { param } from '../util/param.js';
 import { asyncHandler } from '../util/asyncHandler.js';
@@ -84,6 +84,25 @@ iposRouter.get(
   }),
 );
 
+/**
+ * The row a rejected insert collided with — by symbol, or by the company key.
+ *
+ * Raw, because `ipos_company_idx` is an expression index over
+ * `public.ipo_name_key(company_name)` and Prisma has no way to express that.
+ * `is not distinct from` matches the index's NULLS NOT DISTINCT: two undated
+ * rows of one company are the same IPO.
+ */
+async function findColliding(symbol: string, companyName: string, openDate: Date | null) {
+  const hit = await prisma.$queryRaw<{ id: string }[]>`
+    select id from public.ipos
+    where symbol = ${symbol}
+       or (public.ipo_name_key(company_name) = public.ipo_name_key(${companyName})
+           and open_date is not distinct from ${openDate}::date)
+    limit 1
+  `;
+  return hit.length === 0 ? null : prisma.ipo.findUnique({ where: { id: hit[0].id } });
+}
+
 const manualIpoSchema = z.object({
   symbol: z.string().min(1),
   company_name: z.string().min(1),
@@ -102,25 +121,40 @@ iposRouter.post(
   '/',
   asyncHandler(async (req, res) => {
     const body = manualIpoSchema.parse(req.body);
-    const row = await prisma.ipo.create({
-      data: {
-        symbol: body.symbol,
-        companyName: body.company_name,
-        segment: body.segment,
-        openDate: date(body.open_date),
-        closeDate: date(body.close_date),
-        allotmentDate: date(body.allotment_date),
-        listingDate: date(body.listing_date),
-        priceBandMin: decimal(body.price_band_min),
-        priceBandMax: decimal(body.price_band_max),
-        lotSize: body.lot_size,
-        registrar: body.registrar,
-        source: 'MANUAL',
-        exchange: 'NSE',
-        createdBy: userId(req),
-      },
-    });
-    res.status(201).json(ipoRow(row));
+    try {
+      const row = await prisma.ipo.create({
+        data: {
+          symbol: body.symbol,
+          companyName: body.company_name,
+          segment: body.segment,
+          openDate: date(body.open_date),
+          closeDate: date(body.close_date),
+          allotmentDate: date(body.allotment_date),
+          listingDate: date(body.listing_date),
+          priceBandMin: decimal(body.price_band_min),
+          priceBandMax: decimal(body.price_band_max),
+          lotSize: body.lot_size,
+          registrar: body.registrar,
+          source: 'MANUAL',
+          exchange: 'NSE',
+          createdBy: userId(req),
+        },
+      });
+      res.status(201).json(ipoRow(row));
+    } catch (err) {
+      // One IPO is one row, table-wide — by symbol (ipos_symbol_idx) and by
+      // company + open date (ipos_company_idx). Adding one that already exists
+      // is not an error to show the user: hand back the row that won and let the
+      // client carry on with it. 200 rather than 201, because nothing was made.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const existing = await findColliding(body.symbol, body.company_name, date(body.open_date));
+        if (existing) {
+          res.status(200).json(ipoRow(existing));
+          return;
+        }
+      }
+      throw err;
+    }
   }),
 );
 
@@ -150,27 +184,59 @@ iposRouter.patch(
       throw forbidden('read_only_ipo', 'Synced IPOs cannot be edited.');
     }
 
-    const row = await prisma.ipo.update({
-      where: { id: param(req, 'id') },
-      data: {
-        ...(body.symbol === undefined ? {} : { symbol: body.symbol }),
-        ...(body.company_name === undefined ? {} : { companyName: body.company_name }),
-        ...(body.segment === undefined ? {} : { segment: body.segment }),
-        ...(body.status === undefined ? {} : { status: body.status }),
-        ...(body.open_date === undefined ? {} : { openDate: date(body.open_date) }),
-        ...(body.close_date === undefined ? {} : { closeDate: date(body.close_date) }),
-        ...(body.allotment_date === undefined ? {} : { allotmentDate: date(body.allotment_date) }),
-        ...(body.listing_date === undefined ? {} : { listingDate: date(body.listing_date) }),
-        ...(body.price_band_min === undefined ? {} : { priceBandMin: decimal(body.price_band_min) }),
-        ...(body.price_band_max === undefined ? {} : { priceBandMax: decimal(body.price_band_max) }),
-        ...(body.listing_price === undefined ? {} : { listingPrice: decimal(body.listing_price) }),
-        ...(body.current_price === undefined ? {} : { currentPrice: decimal(body.current_price) }),
-        ...(body.lot_size === undefined ? {} : { lotSize: body.lot_size }),
-        ...(body.registrar === undefined ? {} : { registrar: body.registrar }),
-        ...(body.registrar_url === undefined ? {} : { registrarUrl: body.registrar_url }),
-      },
-    });
+    // Renaming onto a symbol that already exists cannot silently fold two rows
+    // together the way a create can — the caller asked to edit this specific
+    // IPO, and its applications hang off it. Say no instead.
+    if (body.symbol !== undefined) {
+      const clash = await prisma.ipo.findUnique({
+        where: { symbol: body.symbol },
+        select: { id: true },
+      });
+      if (clash && clash.id !== param(req, 'id')) {
+        throw conflict('23505', 'Another IPO already uses that symbol.');
+      }
+    }
 
-    res.json(ipoRow(row));
+    try {
+      const row = await prisma.ipo.update({
+        where: { id: param(req, 'id') },
+        data: {
+          ...(body.symbol === undefined ? {} : { symbol: body.symbol }),
+          ...(body.company_name === undefined ? {} : { companyName: body.company_name }),
+          ...(body.segment === undefined ? {} : { segment: body.segment }),
+          ...(body.status === undefined ? {} : { status: body.status }),
+          ...(body.open_date === undefined ? {} : { openDate: date(body.open_date) }),
+          ...(body.close_date === undefined ? {} : { closeDate: date(body.close_date) }),
+          ...(body.allotment_date === undefined
+            ? {}
+            : { allotmentDate: date(body.allotment_date) }),
+          ...(body.listing_date === undefined ? {} : { listingDate: date(body.listing_date) }),
+          ...(body.price_band_min === undefined
+            ? {}
+            : { priceBandMin: decimal(body.price_band_min) }),
+          ...(body.price_band_max === undefined
+            ? {}
+            : { priceBandMax: decimal(body.price_band_max) }),
+          ...(body.listing_price === undefined
+            ? {}
+            : { listingPrice: decimal(body.listing_price) }),
+          ...(body.current_price === undefined
+            ? {}
+            : { currentPrice: decimal(body.current_price) }),
+          ...(body.lot_size === undefined ? {} : { lotSize: body.lot_size }),
+          ...(body.registrar === undefined ? {} : { registrar: body.registrar }),
+          ...(body.registrar_url === undefined ? {} : { registrarUrl: body.registrar_url }),
+        },
+      });
+
+      res.json(ipoRow(row));
+    } catch (err) {
+      // The company key (name + open date) can collide too, and unlike a create
+      // there is nothing sensible to fold into — the caller named this row.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw conflict('23505', 'Another IPO already has that symbol, or that name and date.');
+      }
+      throw err;
+    }
   }),
 );

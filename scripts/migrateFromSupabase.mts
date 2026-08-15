@@ -105,7 +105,10 @@ async function insertAll(table: string, rows: Row[], conflictTarget = 'id'): Pro
 
   const quoted = columns.map((c) => `"${c}"`).join(', ');
   const placeholders = columns.map((c, i) => `$${i + 1}::${types.get(c)}`).join(', ');
-  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${placeholders}) ON CONFLICT (${conflictTarget}) DO NOTHING`;
+  // An empty target is a bare ON CONFLICT DO NOTHING — skip on any constraint,
+  // not only the named one.
+  const onConflict = conflictTarget === '' ? 'ON CONFLICT' : `ON CONFLICT (${conflictTarget})`;
+  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${placeholders}) ${onConflict} DO NOTHING`;
 
   let inserted = 0;
   for (const row of rows) {
@@ -194,8 +197,14 @@ async function main() {
   }
 
   for (const table of TABLES) {
-    // password_reset_tokens keys on token_hash, everything else on id.
-    console.log(`${table.padEnd(17)}inserted=${await insertAll(table, source[table])}`);
+    // password_reset_tokens keys on token_hash, everything else on id — except
+    // `ipos`, where a source row can also clash on the unique symbol. An empty
+    // target means a bare ON CONFLICT DO NOTHING, which covers every constraint
+    // on the table rather than just the primary key.
+    const conflictTarget = table === 'ipos' ? '' : undefined;
+    console.log(
+      `${table.padEnd(17)}inserted=${await insertAll(table, source[table], conflictTarget)}`,
+    );
   }
 
   console.log('\n--- verifying ---');
