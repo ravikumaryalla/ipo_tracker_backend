@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    // Deliberately off, matching the root tsconfig. The scraper parsers under
+    // src/jobs are a verbatim port from the Deno functions and index into regex
+    // match arrays throughout; turning this on would mean rewriting code whose
+    // whole claim to correctness is that it is unchanged.
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}

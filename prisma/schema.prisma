@@ -1,0 +1,347 @@
+// IPO Tracker — data model.
+//
+// SECURITY CONTRACT (carried over from supabase/migrations/20260809000001_init.sql)
+// Every column holding a demat credential ends in `_enc` and is TEXT holding
+// base64(nonce || ciphertext) produced on the device with XChaCha20-Poly1305.
+// The server never holds the vault key and must never be able to read a
+// password. The single deliberate exception is `DematAccount.pan`, which is
+// plaintext because the allotment job has to query KFintech with it.
+//
+// Row Level Security is gone with Supabase. Ownership is now enforced in the
+// Express handlers — every query on a user-owned table filters on the caller's
+// id. See server/src/middleware/auth.ts.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum IpoSegment {
+  MAINBOARD
+  SME
+
+  @@map("ipo_segment")
+}
+
+enum IpoStatus {
+  UPCOMING
+  OPEN
+  CLOSED
+  LISTED
+  WITHDRAWN
+
+  @@map("ipo_status")
+}
+
+enum ApplicationCategory {
+  RETAIL
+  SHNI
+  BHNI
+  SHAREHOLDER
+  EMPLOYEE
+  POLICYHOLDER
+
+  @@map("application_category")
+}
+
+enum ApplicationStatus {
+  APPLIED
+  ALLOTTED
+  PARTIAL
+  NOT_ALLOTTED
+  WITHDRAWN
+  REFUNDED
+
+  @@map("application_status")
+}
+
+/// Replaces Supabase's auth.users. Ids are preserved from the old table on
+/// import so every existing foreign key still resolves.
+model User {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String    @unique
+  passwordHash    String    @map("password_hash")
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  profile        Profile?
+  dematAccounts  DematAccount[]
+  ipos           Ipo[]
+  applications   IpoApplication[]
+  credentialLog  CredentialHistory[]
+  pushTokens     PushToken[]
+  refreshTokens  RefreshToken[]
+  passwordResets PasswordResetToken[]
+
+  @@map("users")
+}
+
+/// Opaque, rotating. Stored as sha256 so a database read does not yield a
+/// usable session.
+model RefreshToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  tokenHash String    @id @map("token_hash")
+  userId    String    @map("user_id") @db.Uuid
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+/// One row per user, holding the public half of the vault crypto. The salt and
+/// verifier are public by design — the passphrase never leaves the device.
+model Profile {
+  id                String   @id @db.Uuid
+  displayName       String?  @map("display_name")
+  vaultSalt         String?  @map("vault_salt")
+  vaultVerifier     String?  @map("vault_verifier")
+  vaultRecoveryBlob String?  @map("vault_recovery_blob")
+  autoLockMinutes   Int      @default(5) @map("auto_lock_minutes")
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [id], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+
+/// Shared reference data. Readable by any signed-in user, seeded by migration.
+model Broker {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  slug      String   @unique
+  website   String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  accounts DematAccount[]
+
+  @@map("brokers")
+}
+
+/// The vault. Every sensitive field is ciphertext produced on-device.
+model DematAccount {
+  id       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId   String  @map("user_id") @db.Uuid
+  brokerId String? @map("broker_id") @db.Uuid
+
+  /// Non-secret label, so the list renders without unlocking the vault.
+  nickname String
+
+  clientIdEnc   String? @map("client_id_enc")
+  dpIdEnc       String? @map("dp_id_enc")
+  boIdEnc       String? @map("bo_id_enc")
+  emailEnc      String? @map("email_enc")
+  phoneEnc      String? @map("phone_enc")
+  passwordEnc   String? @map("password_enc")
+  mpinEnc       String? @map("mpin_enc")
+  upiIdEnc      String? @map("upi_id_enc")
+  linkedBankEnc String? @map("linked_bank_enc")
+  notesEnc      String? @map("notes_enc")
+
+  /// Legacy encrypted PAN, kept only as the source for the one-time
+  /// client-side backfill into `pan`. See lib/db/accounts.ts#migratePanIfNeeded.
+  panEnc String? @map("pan_enc")
+
+  /// Deliberate plaintext exception — the allotment job needs a readable PAN
+  /// and the server has never held the vault key. See
+  /// supabase/migrations/20260811000007_pan_plaintext.sql for the rationale.
+  pan String?
+
+  isActive          Boolean   @default(true) @map("is_active")
+  openedOn          DateTime? @map("opened_on") @db.Date
+  passwordChangedAt DateTime? @map("password_changed_at") @db.Timestamptz(6)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  broker        Broker?             @relation(fields: [brokerId], references: [id], onDelete: SetNull)
+  applications  IpoApplication[]
+  credentialLog CredentialHistory[]
+
+  @@map("demat_accounts")
+}
+
+/// Public market data. `createdBy` null means a synced/shared row; a non-null
+/// value means one user typed it in manually and only they can see it.
+model Ipo {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  symbol       String
+  companyName  String     @map("company_name")
+  exchange     String     @default("NSE")
+  segment      IpoSegment @default(MAINBOARD)
+  status       IpoStatus  @default(UPCOMING)
+
+  openDate      DateTime? @map("open_date") @db.Date
+  closeDate     DateTime? @map("close_date") @db.Date
+  allotmentDate DateTime? @map("allotment_date") @db.Date
+  listingDate   DateTime? @map("listing_date") @db.Date
+
+  priceBandMin Decimal? @map("price_band_min") @db.Decimal(12, 2)
+  priceBandMax Decimal? @map("price_band_max") @db.Decimal(12, 2)
+  lotSize      Int?     @map("lot_size")
+  issueSizeCr  Decimal? @map("issue_size_cr") @db.Decimal(14, 2)
+  listingPrice Decimal? @map("listing_price") @db.Decimal(12, 2)
+  currentPrice Decimal? @map("current_price") @db.Decimal(12, 2)
+
+  registrar    String? @default("KFintech")
+  registrarUrl String? @default("https://ipostatus.kfintech.com/") @map("registrar_url")
+
+  /// KFintech's internal clientId for this issue's allotment lookup, resolved
+  /// once per issue by the sync job. Null when unmatched.
+  kfintechCompanyId String? @map("kfintech_company_id")
+
+  source       String    @default("MANUAL")
+  createdBy    String?   @map("created_by") @db.Uuid
+  lastSyncedAt DateTime? @map("last_synced_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  creator      User?            @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  applications IpoApplication[]
+  gmp          IpoGmp[]
+
+  /// The sync upsert key: two IPOs never share a symbol and an open date.
+  @@unique([symbol, openDate], map: "ipos_symbol_open_idx")
+  @@index([openDate(sort: Desc)], map: "ipos_dates_idx")
+  @@map("ipos")
+}
+
+model IpoApplication {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String @map("user_id") @db.Uuid
+  ipoId          String @map("ipo_id") @db.Uuid
+  dematAccountId String @map("demat_account_id") @db.Uuid
+
+  category ApplicationCategory @default(RETAIL)
+  lots     Int
+  bidPrice Decimal             @map("bid_price") @db.Decimal(12, 2)
+
+  /// Denormalised so history stays correct if the IPO's lot size is edited.
+  sharesApplied Int     @map("shares_applied")
+  amountBlocked Decimal @map("amount_blocked") @db.Decimal(14, 2)
+
+  applicationNo String?  @map("application_no")
+  upiRef        String?  @map("upi_ref")
+  appliedAt     DateTime @default(now()) @map("applied_at") @db.Timestamptz(6)
+
+  status             ApplicationStatus @default(APPLIED)
+  sharesAllotted     Int               @default(0) @map("shares_allotted")
+  allotmentCheckedAt DateTime?         @map("allotment_checked_at") @db.Timestamptz(6)
+
+  sellPrice Decimal?  @map("sell_price") @db.Decimal(12, 2)
+  soldAt    DateTime? @map("sold_at") @db.Timestamptz(6)
+  notes     String?
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ipo          Ipo          @relation(fields: [ipoId], references: [id], onDelete: Cascade)
+  dematAccount DematAccount @relation(fields: [dematAccountId], references: [id], onDelete: Cascade)
+
+  /// One application per account per category per IPO — a SEBI rule. The client
+  /// turns the resulting 23505 into a specific message, so this constraint name
+  /// is API surface.
+  @@unique([ipoId, dematAccountId, category], map: "ipo_applications_unique_bid")
+  @@index([userId], map: "ipo_applications_user_idx")
+  @@index([ipoId], map: "ipo_applications_ipo_idx")
+  @@map("ipo_applications")
+}
+
+/// Append-only: prior ciphertext, so a bad edit is recoverable. Never updated.
+model CredentialHistory {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  dematAccountId String   @map("demat_account_id") @db.Uuid
+  field          String
+  oldValueEnc    String   @map("old_value_enc")
+  changedAt      DateTime @default(now()) @map("changed_at") @db.Timestamptz(6)
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dematAccount DematAccount @relation(fields: [dematAccountId], references: [id], onDelete: Cascade)
+
+  @@index([dematAccountId, changedAt(sort: Desc)], map: "credential_history_account_idx")
+  @@map("credential_history")
+}
+
+/// Append-only grey market premium readings. Unofficial, manipulable data —
+/// anything rendering it must say so.
+model IpoGmp {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Nullable on purpose: providers often quote a grey market before NSE/BSE
+  /// publish the issue. The sync job's backfill pass re-tries these each run.
+  ipoId String? @map("ipo_id") @db.Uuid
+
+  provider     String    @default("IPOWATCH")
+  providerSlug String    @map("provider_slug")
+  companyName  String    @map("company_name")
+  openDate     DateTime? @map("open_date") @db.Date
+
+  /// The provider's own "last updated" stamp, NOT our fetch time — two syncs
+  /// seeing the same reading must not put two points on the chart.
+  observedAt DateTime @map("observed_at") @db.Timestamptz(6)
+
+  gmp        Decimal? @db.Decimal(12, 2)
+  gmpPercent Decimal? @map("gmp_percent") @db.Decimal(6, 2)
+  price      Decimal? @db.Decimal(12, 2)
+  subTimes   Decimal? @map("sub_times") @db.Decimal(10, 2)
+  sourceUrl  String?  @map("source_url")
+
+  syncedAt  DateTime @default(now()) @map("synced_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ipo Ipo? @relation(fields: [ipoId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerSlug, observedAt], map: "ipo_gmp_reading_idx")
+  @@index([ipoId, observedAt(sort: Desc)], map: "ipo_gmp_ipo_idx")
+  @@map("ipo_gmp")
+}
+
+/// Why the IPO list is stale, surfaced in-app instead of failing quietly.
+model SyncLog {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider     String
+  ok           Boolean
+  rowsUpserted Int      @default(0) @map("rows_upserted")
+  message      String?
+  ranAt        DateTime @default(now()) @map("ran_at") @db.Timestamptz(6)
+
+  @@index([ranAt(sort: Desc)], map: "sync_log_ran_at_idx")
+  @@map("sync_log")
+}
+
+/// Expo push tokens, one row per device — an account can have the app on more
+/// than one phone.
+model PushToken {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  token     String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, token])
+  @@map("push_tokens")
+}
