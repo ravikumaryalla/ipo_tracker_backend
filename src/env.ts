@@ -14,6 +14,8 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PASSWORD_RESET_URL: z.string().default('ipotracker://reset-password'),
   CORS_ORIGINS: z.string().default(''),
+  /** Turns on the full request/response payload log. Off unless asked for. */
+  DEBUG_HTTP: z.string().default(''),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -27,6 +29,13 @@ export const env = {
   corsOrigins: parsed.data.CORS_ORIGINS.split(',')
     .map((s) => s.trim())
     .filter(Boolean),
+  /**
+   * Never on under NODE_ENV=test, whatever the var says — the suites would
+   * otherwise bury their own failures under every payload they exchange.
+   */
+  debugHttp:
+    ['1', 'true', 'yes'].includes(parsed.data.DEBUG_HTTP.trim().toLowerCase()) &&
+    parsed.data.NODE_ENV !== 'test',
 };
 
 /** Access tokens are short-lived; the refresh token is the real session. */
